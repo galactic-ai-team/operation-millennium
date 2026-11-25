@@ -184,6 +184,29 @@ def test_primary_solver_reproduces_ed6d557_exactly():
     assert compared == 150
 
 
+def test_propagation_count_semantics_ace_plan_04():
+    # ACE-PLAN-04: the documented counting convention of the frozen DPLL
+    # (docs/phase3/OM-C001-R2_RUNNER.md, section 10.8). A propagation is
+    # counted when a previously unassigned variable is assigned by a
+    # unit-clause batch; decisions are branch attempts.
+    # A repeated unit is counted once; the next batch sees the new unit.
+    r = solve_dpll(2, [[1], [1], [-1, 2]])
+    assert (r.status, r.decisions, r.propagations) == (Status.SAT, 0, 2)
+    # A batch stops at the first conflicting unit: x1 is counted, the
+    # conflicting [-1] is not, and [2] later in the same batch is never assigned.
+    r = solve_dpll(2, [[1], [-1], [2]])
+    assert (r.status, r.decisions, r.propagations) == (Status.UNSAT, 0, 1)
+    # Propagations inside a refuted branch stay counted (the counter is global).
+    # Branch x1=True propagates x3 (counted) then conflicts on -3; branch
+    # x1=False propagates x2.
+    r = solve_dpll(3, [[1, 2], [-1, 3], [-1, -3]])
+    assert (r.status, r.decisions, r.propagations) == (Status.SAT, 2, 2)
+    # A batch assigns all its units before re-simplifying: both units are
+    # counted, then the next simplification finds [-1, -2] empty (conflict).
+    r = solve_dpll(2, [[1], [2], [-1, -2]])
+    assert (r.status, r.decisions, r.propagations) == (Status.UNSAT, 0, 2)
+
+
 def test_runner_branch_counts_match_ed6d557_on_pilot_instances():
     specs = _pilot_specs(n_values=(30, 40), a_values=(426, 500), indices=range(0, 3))
     out = wx.run_specs(specs, workers=0)
