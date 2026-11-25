@@ -31,6 +31,7 @@ from om_lab.analyze_width import (
     records_to_rows,
     seed_manifest,
     verification_gates,
+    _reproducibility,
 )
 from om_lab.generators import generate_random_3sat
 from om_lab.hard_instances import generate_php
@@ -216,6 +217,18 @@ def test_seed_manifest_shape_and_collisions():
 # ---------------------------------------------------------------------------
 # Synthetic rows for the frozen models (hand-computed)
 # ---------------------------------------------------------------------------
+
+
+def _current_repro_manifest():
+    """A reproducibility manifest built from the current environment,
+    so confirmatory-shaped tests pass the DEE-R9-18 gate (which
+    compares the NumPy version and source hashes against the frozen
+    manifest). The gate's failure modes are tested separately."""
+    rep = _reproducibility("confirmatory")
+    return {
+        "environment": {"packages": {"numpy": rep["numpy_version"]}},
+        "source_sha256": dict(rep["source_file_sha256"]),
+    }
 
 
 def _row(n, m, split, width, degree, y, index=0, status="SAT"):
@@ -437,7 +450,8 @@ def test_analyze_rows_pass_on_strong_width_signal():
     summary = analyze_rows(rows, "synthetic", bootstrap_replicates=100)
     assert summary["primary_disposition"]["disposition"] == "INCONCLUSIVE"
     rows = _confirmatory_synthetic("width")
-    summary = analyze_rows(rows, "confirmatory", bootstrap_replicates=200)
+    summary = analyze_rows(rows, "confirmatory", bootstrap_replicates=200,
+        reproducibility_manifest=_current_repro_manifest())
     assert summary["integrity_gates"]["passed"] is True
     assert summary["verification_gates"]["passed"] is True
     assert summary["primary_disposition"]["disposition"] == "PASS"
@@ -453,7 +467,8 @@ def test_analyze_rows_pass_on_strong_width_signal():
 
 def test_analyze_rows_fail_when_width_carries_no_signal():
     rows = _confirmatory_synthetic("none")
-    summary = analyze_rows(rows, "confirmatory", bootstrap_replicates=200)
+    summary = analyze_rows(rows, "confirmatory", bootstrap_replicates=200,
+        reproducibility_manifest=_current_repro_manifest())
     assert summary["primary_disposition"]["disposition"] == "FAIL"
     assert summary["primary_disposition"]["point_improvement"] < 0.05
     assert summary["primary_disposition"]["point_improvement"] == pytest.approx(0.0)
@@ -481,7 +496,8 @@ def test_verification_gate_blocks_pass_for_uncertified_unsat():
     rows = _confirmatory_synthetic(
         "width", unsat_verification="UNSAT_SOLVER_AGREEMENT_ONLY"
     )
-    summary = analyze_rows(rows, "confirmatory", bootstrap_replicates=200)
+    summary = analyze_rows(rows, "confirmatory", bootstrap_replicates=200,
+        reproducibility_manifest=_current_repro_manifest())
     assert summary["primary_disposition"]["disposition"] == "INCONCLUSIVE"
     assert summary["primary_disposition"]["effort_only_disposition"] == "PASS"
     assert summary["verification_gates"]["passed"] is False
@@ -489,7 +505,8 @@ def test_verification_gate_blocks_pass_for_uncertified_unsat():
     rows2 = _confirmatory_synthetic(
         "width", unsat_verification="UNSAT_PROOF_CHECKED"
     )
-    summary2 = analyze_rows(rows2, "confirmatory", bootstrap_replicates=200)
+    summary2 = analyze_rows(rows2, "confirmatory", bootstrap_replicates=200,
+        reproducibility_manifest=_current_repro_manifest())
     assert summary2["verification_gates"]["passed"] is True
     assert summary2["primary_disposition"]["disposition"] == "PASS"
 
@@ -581,3 +598,153 @@ def test_generate_pilot_rows_smoke(tmp_path):
     assert summary["primary_disposition"]["disposition"] == "INCONCLUSIVE"
     assert summary["evaluation"] is not None
     assert len(summary["evaluation"]["per_cell"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 PR #9 repairs (Nova; Dee remains the reviewer of the fixes)
+# ---------------------------------------------------------------------------
+
+
+def _paired_fixture():
+    """Paired test rows for bootstrap tests: cell A (2 rows) with
+    err_m0=1, err_m1=1; cell B (4 rows) with err_m0=2, err_m1=0."""
+    paired = []
+    for (n, m), err0, err1, count in [
+        ((30, 380), 1.0, 1.0, 2),
+        ((40, 400), 2.0, 0.0, 4),
+    ]:
+        for k in range(count):
+            paired.append(
+                {
+                    "n": n,
+                    "m": m,
+                    "err_m0": err0,
+                    "err_m1": err1,
+                }
+            )
+    return paired
+
+
+def test_DEE_R9_17_bootstrap_is_equal_cell_weighted():
+    # With constant errors per cell, every replicate gives the same
+    # equal-cell-weighted improvement: 1 - 0.5/1.5 = 2/3. Row-weighted
+    # would give 0.8.
+    result = paired_stratified_bootstrap(
+        _paired_fixture(), replicates=50, seed=123
+    )
+    assert result["n_defined"] == 50
+    assert result["n_undefined"] == 0
+    assert result["ci_lower_2.5"] == pytest.approx(2 / 3)
+    assert result["ci_upper_97.5"] == pytest.approx(2 / 3)
+    assert result["mean"] == pytest.approx(2 / 3)
+
+
+def test_DEE_R9_17_bootstrap_samples_exactly_30_per_cell():
+    # Section 3.10 fixes the per-cell resample size at 30,
+    # regardless of the cell's size. Record the size argument of
+    # every rng.integers call the bootstrap makes.
+    import numpy as np
+    from unittest import mock
+
+    sizes: list[int] = []
+    real_default_rng = np.random.default_rng
+
+    def recording(seed):
+        rng = real_default_rng(seed)
+
+        class Rec:
+            def integers(self, low, high=None, size=None, **kwargs):
+                sizes.append(size)
+                return rng.integers(low, high, size=size, **kwargs)
+
+        return Rec()
+
+    with mock.patch.object(np.random, "default_rng", side_effect=recording):
+        paired_stratified_bootstrap(_paired_fixture(), replicates=3, seed=7)
+    assert sizes, "expected the bootstrap to draw from the RNG"
+    assert all(s == 30 for s in sizes), sizes
+    assert len(sizes) == 3 * 2  # 3 replicates x 2 cells
+
+
+def test_DEE_R9_18_reproducibility_gate_unevaluated_blocks_confirmatory():
+    # No manifest supplied: the gate is unevaluated, which forces
+    # INCONCLUSIVE for the confirmatory population even on a strong
+    # width signal.
+    rows = _confirmatory_synthetic("width")
+    summary = analyze_rows(rows, "confirmatory", bootstrap_replicates=200)
+    assert summary["reproducibility_gates"]["evaluated"] is False
+    assert summary["reproducibility_gates"]["passed"] is False
+    assert summary["primary_disposition"]["disposition"] == "INCONCLUSIVE"
+    assert any(
+        "reproducibility gate not evaluated" in r
+        for r in summary["primary_disposition"]["reasons"]
+    )
+
+
+def test_DEE_R9_18_reproducibility_gate_fails_on_numpy_mismatch():
+    rows = _confirmatory_synthetic("width")
+    manifest = _current_repro_manifest()
+    manifest["environment"]["packages"]["numpy"] = "0.0.0"
+    summary = analyze_rows(
+        rows, "confirmatory", bootstrap_replicates=200,
+        reproducibility_manifest=manifest,
+    )
+    assert summary["reproducibility_gates"]["passed"] is False
+    assert any(
+        "numpy version differs" in f
+        for f in summary["reproducibility_gates"]["failures"]
+    )
+    assert summary["primary_disposition"]["disposition"] == "INCONCLUSIVE"
+
+
+def test_DEE_R9_18_reproducibility_gate_fails_on_source_hash_mismatch():
+    rows = _confirmatory_synthetic("width")
+    manifest = _current_repro_manifest()
+    manifest["source_sha256"]["analyze_width.py"] = "0" * 64
+    summary = analyze_rows(
+        rows, "confirmatory", bootstrap_replicates=200,
+        reproducibility_manifest=manifest,
+    )
+    assert summary["reproducibility_gates"]["passed"] is False
+    assert any(
+        "source hash differs for analyze_width.py" in f
+        for f in summary["reproducibility_gates"]["failures"]
+    )
+    assert summary["primary_disposition"]["disposition"] == "INCONCLUSIVE"
+
+
+def test_DEE_R9_02_bootstrap_none_reason_is_unavailable():
+    # With a strong point improvement but no bootstrap, the reason
+    # must say the bootstrap is unavailable, not that the interval
+    # includes zero.
+    from om_lab.analyze_width import primary_disposition
+
+    out = primary_disposition(
+        {"improvement": 0.5},
+        None,
+        {"passed": True, "failures": []},
+        {"passed": True, "failures": []},
+        {"beta": 1.0},
+        eval_error="bootstrap exploded",
+    )
+    assert out["disposition"] == "INCONCLUSIVE"
+    assert any("bootstrap unavailable" in r for r in out["reasons"])
+    assert not any("includes zero" in r for r in out["reasons"])
+
+
+def test_DEE_R9_19_effort_only_gated_on_integrity_gates():
+    # Integrity gates failing force effort_only to INCONCLUSIVE even
+    # when the point improvement is strong; verification-gate-only
+    # failures still report the effort signal (see
+    # test_verification_gate_blocks_pass_for_uncertified_unsat).
+    from om_lab.analyze_width import primary_disposition
+
+    out = primary_disposition(
+        {"improvement": 0.5},
+        {"ci_lower_2.5": 0.1, "ci_upper_97.5": 0.9, "n_undefined": 0},
+        {"passed": False, "failures": ["duplicate seeds"]},
+        {"passed": False, "failures": ["uncertified UNSAT"]},
+        {"beta": 1.0},
+    )
+    assert out["disposition"] == "INCONCLUSIVE"
+    assert out["effort_only_disposition"] == "INCONCLUSIVE"

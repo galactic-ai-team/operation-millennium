@@ -490,8 +490,9 @@ class TestReviewRegressions:
     test should be updated to assert the fixed behaviour.
     """
 
-    def test_DEE_R9_01_integrity_gates_breaks_on_first_failure(self):
-        """Only the first Y-out-of-range row is reported."""
+    def test_DEE_R9_01_integrity_gates_reports_every_failure(self):
+        """Fixed (Nova, Phase 4 PR #9 repair): the early ``break`` is
+        gone, so both Y-out-of-range rows are reported."""
         from om_lab.analyze_width import integrity_gates
 
         rows = [
@@ -501,45 +502,57 @@ class TestReviewRegressions:
         gates = integrity_gates(rows, "synthetic")
         assert not gates["passed"]
         y_failures = [f for f in gates["failures"] if "Y out of range" in f]
-        # Current behaviour: exactly one, because the loop breaks.
-        # Correct behaviour would be two.  This assertion documents
-        # DEE-R9-01 and should be flipped when the bug is fixed.
-        assert len(y_failures) == 1
+        assert len(y_failures) == 2
 
-    def test_DEE_R9_04_analyze_rows_crashes_on_error_row(self):
-        """A row with ``status='ERROR'`` and ``y=None`` raises TypeError."""
+    def test_DEE_R9_04_analyze_rows_filters_error_row(self):
+        """Fixed (Nova, Phase 4 PR #9 repair): a row with
+        ``status='ERROR'`` and ``y=None`` is excluded as missing data
+        instead of raising TypeError, and counted."""
         from om_lab.analyze_width import analyze_rows
 
         error_row = _make_row(
             split="train", index=0, seed=1, y=None, decisions=None,
             status="ERROR", verification_status="NOT_APPLICABLE",
         )
-        with pytest.raises(TypeError):
-            analyze_rows([error_row], "synthetic")
+        summary = analyze_rows([error_row], "synthetic")
+        assert summary["counts"]["n_error_rows"] == 1
+        assert summary["counts"]["n_rows"] == 0
+        assert summary["primary_disposition"]["disposition"] == "INCONCLUSIVE"
 
-    def test_DEE_R9_05_phase1_seeds_below_10m_inverted(self):
-        """The boolean is inverted: True when *not all* seeds are below 10M."""
+    def test_DEE_R9_04_integrity_gates_reports_none_values(self):
+        """Fixed (Nova, Phase 4 PR #9 repair): a None y/decisions/
+        width is a gate failure naming the row, not a TypeError."""
+        from om_lab.analyze_width import integrity_gates
+
+        row = _make_row(
+            split="train", index=0, seed=1, y=None, decisions=None,
+            status="ERROR", verification_status="NOT_APPLICABLE",
+        )
+        gates = integrity_gates([row], "synthetic")
+        assert not gates["passed"]
+        assert any("None" in f for f in gates["failures"])
+
+    def test_DEE_R9_05_phase1_seeds_below_10m_matches_name(self):
+        """Fixed (Nova, Phase 4 PR #9 repair): the boolean now matches
+        its name -- True when all seeds are below 10M."""
         from om_lab.analyze_width import check_seed_manifest
 
         all_small = [{"seed": 1}, {"seed": 2}, {"seed": 3}]
         result_small = check_seed_manifest(all_small)
-        # All seeds are below 10M, so the name would say True; the
-        # implementation says False.  Inverted.
-        assert result_small["phase1_seeds_below_10m"] is False
+        assert result_small["phase1_seeds_below_10m"] is True
 
         one_big = [{"seed": 1}, {"seed": 20_000_000}]
         result_big = check_seed_manifest(one_big)
-        # Not all seeds are below 10M, so the name would say False; the
-        # implementation says True.  Inverted.
-        assert result_big["phase1_seeds_below_10m"] is True
+        assert result_big["phase1_seeds_below_10m"] is False
 
-    def test_DEE_R9_17_evaluate_uses_row_weighting(self):
-        """``evaluate`` weights rows, not cells, when cell sizes differ.
+    def test_DEE_R9_17_evaluate_uses_equal_cell_weighting(self):
+        """Fixed (Nova, Phase 4 PR #9 repair): ``evaluate`` weights
+        cells, not rows, when cell sizes differ.
 
         Two cells: cell A (2 rows) with err_m0=1, err_m1=1; cell B (4
         rows) with err_m0=2, err_m1=0.  Row-weighted improvement is
-        1 - (2/6)/(10/6) = 0.8.  Equal-cell-weighted would be
-        1 - (1 + 0)/2 = 0.5.  The implementation gives 0.8.
+        1 - (2/6)/(10/6) = 0.8.  Equal-cell-weighted is
+        1 - ((1+0)/2) / ((1+2)/2) = 1 - 0.5/1.5 = 2/3.
         """
         from om_lab.analyze_width import evaluate
 
@@ -574,18 +587,17 @@ class TestReviewRegressions:
                       y=2.0, width=2, decisions=None),
         ]
         result = evaluate(rows, fit, fit_deg)
-        assert abs(result["improvement"] - 0.8) < 1e-9, result
-        assert abs(result["improvement"] - 0.5) > 0.1, result
+        assert abs(result["improvement"] - (2 / 3)) < 1e-9, result
+        assert abs(result["improvement"] - 0.8) > 0.1, result
 
-    def test_DEE_R9_20_check_seed_manifest_inconsistent_thresholds(self):
-        """``disjoint_from_phase1_scheme`` and ``phase1_seeds_below_10m``
-        use different thresholds (102126 vs 10^7)."""
+    def test_DEE_R9_20_check_seed_manifest_single_threshold(self):
+        """Fixed (Nova, Phase 4 PR #9 repair): both phase-1 checks
+        derive from the one documented PHASE1_SEED_MAX constant, so
+        they agree. Seed 500K is below the bound and not disjoint
+        from the phase-1 scheme."""
         from om_lab.analyze_width import check_seed_manifest
 
-        # Seed 500K is above phase1_max (102126) but below 10^7.
+        # Seed 500K is below 10^7.
         result = check_seed_manifest([{"seed": 500_000}])
-        assert result["disjoint_from_phase1_scheme"] is True
-        # Under the (inverted) name, 500K < 10M, so all(...) is True,
-        # True is False = False.  The two booleans disagree about
-        # whether this seed is "phase 1".
-        assert result["phase1_seeds_below_10m"] is False
+        assert result["phase1_seeds_below_10m"] is True
+        assert result["disjoint_from_phase1_scheme"] is False
