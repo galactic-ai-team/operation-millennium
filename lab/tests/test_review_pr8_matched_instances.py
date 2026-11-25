@@ -18,6 +18,11 @@ draft PR #24 (03b626d) fixes CLAUDE-R8-05/06/07/14/18 and the M16/M18 parts of
 R8-09. The strict xfails for those findings XPASSed there; their markers are
 removed and the tests that pinned the old behaviour now pin the repaired
 behaviour. New Gate B findings are named CLAUDE-G24-NN.
+
+Final Gate B check at 98d5208: Dee's 577e469 closes G24-01 (float n_vars)
+and G24-04 (float or bool charges). G24-08 is OPEN as a strict xfail:
+validate_metadata raises TypeError instead of its documented ValueError
+for non-int charges.
 """
 
 from __future__ import annotations
@@ -381,27 +386,65 @@ def test_g24_validators_accept_every_legitimate_instance():
     assert result["total"] == 1761
 
 
-def test_g24_integrity_fuzz_rejects_every_structural_mutation():
-    """6,000 random single mutations (clauses, charges, edge map, n_vars, graph):
-    the validators accept only no-op mutations, extra metadata keys, and the two
-    type-only gaps CLAUDE-G24-01 (float n_vars) and G24-04 (float charges)."""
-    result = r8.integrity_fuzz()
-    assert set(result["accepted_noncanonical_kinds"]) <= {"n_vars_float", "charges_float"}
-    assert all(v["escaped_non_valueerror"] == 0 for v in result["by_kind"].values())
-    assert sum(v["tried"] for v in result["by_kind"].values()) == 6000
+@pytest.fixture(scope="module")
+def fuzz():
+    return r8.integrity_fuzz()
+
+
+def test_g24_integrity_fuzz_rejects_every_structural_mutation(fuzz):
+    """6,000 random single mutations (clauses, charges, edge map, n_vars, graph).
+    Since Dee's 577e469 the validators accept only no-op mutations and extra
+    metadata keys: the type-only gaps G24-01 (float n_vars) and G24-04 (float
+    charges) are closed."""
+    assert fuzz["accepted_noncanonical_kinds"] == []
+    assert sum(v["tried"] for v in fuzz["by_kind"].values()) == 6000
+
+
+@pytest.mark.xfail(strict=True, reason="CLAUDE-G24-08 OPEN: validate_metadata raises TypeError, not ValueError, for non-int charges")
+def test_g24_08_validators_reject_only_with_value_error(fuzz):
+    """validate_metadata documents ValueError. At 98d5208 every float-charge
+    mutant (401 of 401) is rejected with TypeError instead."""
+    escaped = {k: v["escaped_non_valueerror"] for k, v in fuzz["by_kind"].items() if v["escaped_non_valueerror"]}
+    assert escaped == {}
+
+
+def test_g24_04_charge_type_contract_of_constructor_and_inner_validator():
+    """Accepted contract: encode_tseitin refuses non-int charges with TypeError,
+    as it does non-int edge ids; validate_encoding reports the same hand-built
+    instance with ValueError, as validate_metadata's docstring promises."""
+    with pytest.raises(TypeError, match="charges must be int"):
+        mi.encode_tseitin(mi.k4(), (1.0, 0.0, 0.0, 0.0))
+    with pytest.raises(TypeError, match="charges must be int"):
+        mi.encode_tseitin(mi.k4(), (True, False, False, False))
+    ok = mi.encode_tseitin(mi.k4(), (1, 0, 0, 0))
+    for charges in ((1.0, 0.0, 0.0, 0.0), (True, False, False, False)):
+        with pytest.raises(ValueError, match="charges must be int"):
+            mi.validate_encoding(r8.replace(ok, charges=charges))
+
+
+@pytest.mark.xfail(strict=True, reason="CLAUDE-G24-08 OPEN: validate_metadata raises TypeError, not ValueError, for non-int charges")
+def test_g24_08_validate_metadata_rejects_non_int_charges_with_value_error():
+    ok = mi.encode_tseitin(mi.k4(), (1, 0, 0, 0))
+    for charges in ((1.0, 0.0, 0.0, 0.0), (True, False, False, False)):
+        with pytest.raises(ValueError):
+            mi.validate_metadata(r8.replace(ok, charges=charges))
 
 
 def test_g24_01_non_integer_n_vars_is_rejected():
-    """A hand-built copy of a valid instance with n_vars=6.0 passes validate_metadata,
-    then solve_pysat, solve_dpll and primal_graph raise TypeError on it."""
+    """Repaired by Dee's 577e469. Before it, a hand-built copy of a valid instance
+    with n_vars=6.0 passed validate_metadata, and solve_pysat, solve_dpll and
+    primal_graph then raised TypeError on it."""
     odd = mi.encode_tseitin(mi.k4(), (1, 0, 0, 0))
     with pytest.raises(ValueError):
         mi.validate_metadata(r8.replace(odd, n_vars=6.0))
 
 
 def test_g24_01_consequence_is_a_downstream_type_error_not_a_wrong_label():
+    """Calling the consumers directly on the float-n_vars instance (bypassing the
+    validator): the label is still right, the solvers raise TypeError."""
     rows = r8.pr24_type_probes()
     row = rows["n_vars_float"]
+    assert row["validate_metadata"] == "raises ValueError"  # since 577e469
     assert row["is_parity_satisfiable"] is False  # the label is still right
     assert row["solve_pysat"] == row["solve_dpll"] == row["primal_graph"] == "raises TypeError"
     assert row["certify_tseitin_by_construction"] == "INVALID"

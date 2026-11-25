@@ -56,7 +56,7 @@ from om_lab.solvers import Status, solve_dpll, solve_pysat, verify_cnf_assignmen
 from om_lab.width_features import primal_min_fill_width
 
 ATTACKED_COMMIT = "c8e61a7"  # PR #8 merge commit; target files unchanged at dev f398de6
-GATE_B_PR24_COMMIT = "03b626d"  # Dee's repair of R8-05/06/07/14/18 (draft PR #24), re-attacked at Gate B
+GATE_B_PR24_COMMIT = "98d5208"  # PR #24 final Gate B check (first pass attacked Dee's repair at 03b626d)
 REGISTERED_MOEBIUS_VERTEX_COUNTS = (4, 6, 8, 10, 12, 16, 20, 24, 32)  # DISCOVERY_ROUND_01 s5.4
 REGISTERED_PERMUTATION_SEEDS = tuple(range(100, 120))  # ADVERSARIAL_REVIEW_01 A2
 PERMUTATION_SUITE_BUDGET = 10_000  # project branch budget (OM-C001-R2 B), used for Y_j in A6
@@ -1348,12 +1348,14 @@ def declared_var_cost(tops: Sequence[int] = (10_000, 30_000)) -> dict:
 
 
 def pr24_type_probes() -> dict:
-    """Type-only malformations that PR #24's validators still accept.
+    """Type-only malformations found at Gate B (CLAUDE-G24-01, G24-04).
 
     ``n_vars_float`` is a hand-built copy of a valid odd K4 instance with
-    ``n_vars=6.0``; ``charges_float`` and ``charges_bool`` come straight from
+    ``n_vars=6.0``; ``charges_float`` and ``charges_bool`` are built with
     ``encode_tseitin``. For each: does ``validate_metadata`` accept it, and what
-    do the direct consumers do with it?
+    do the direct consumers do with it? At 03b626d all three were accepted;
+    since Dee's 577e469 ``validate_metadata`` rejects ``n_vars_float`` and
+    ``encode_tseitin`` refuses the non-int charges (TypeError).
     """
     from om_lab.certify import certify_tseitin_by_construction
 
