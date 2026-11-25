@@ -29,7 +29,9 @@ jobs:
         run: lake exe cache get
 
       - name: Build (prints #print axioms output)
-        run: lake build 2>&1 | tee ../lean-build.log
+        run: |
+          set -o pipefail
+          lake build 2>&1 | tee ../lean-build.log
 
       - name: Reject sorry / sorryAx
         run: |
