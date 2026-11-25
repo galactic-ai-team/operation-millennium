@@ -391,7 +391,6 @@ def test_g24_integrity_fuzz_rejects_every_structural_mutation():
     assert sum(v["tried"] for v in result["by_kind"].values()) == 6000
 
 
-@pytest.mark.xfail(strict=True, reason="CLAUDE-G24-01 OPEN: validate_metadata accepts a non-int n_vars")
 def test_g24_01_non_integer_n_vars_is_rejected():
     """A hand-built copy of a valid instance with n_vars=6.0 passes validate_metadata,
     then solve_pysat, solve_dpll and primal_graph raise TypeError on it."""
