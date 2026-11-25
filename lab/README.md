@@ -80,8 +80,13 @@ per-cell plots.
 python -m om_lab.analyze_width --pilot --out-dir results/width-pilot
 
 # Analyse runner records (Claude's frozen runner) once Lumi has
-# authorised confirmatory execution
-python -m om_lab.analyze_width --records results.jsonl --population confirmatory --out-dir results/width
+# authorised confirmatory execution -- the official command takes the
+# verified Stage A / Stage B handoff (Section 10.11), not a hand-written
+# manifest
+python -m om_lab.analyze_width --records results.jsonl --population confirmatory \
+    --stage-a freeze/freeze_stage_a.json --stage-b freeze/freeze_stage_b.json \
+    --test-run-manifest confirmatory_test_run_manifest.json \
+    --combine-manifest results_combine_manifest.json --out-dir results/width
 ```
 
 > **Freeze warning:** the confirmatory population (Section 3.5,
