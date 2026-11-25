@@ -47,11 +47,17 @@ Review repairs (Phase 4, per REVIEW_PR8_CLAUDE.md and REVIEW_PR24_CLAUDE.md)
 - CLAUDE-G24-04: ``bool`` / non-``int`` charges rejected consistently with
   the edge-id contract.
 - CLAUDE-G24-05: ``validate_encoding`` converts non-iterable clause
-  ``TypeError`` to ``ValueError``; docstring names both exception types.
+  ``TypeError`` to ``ValueError``; its docstring names the one remaining
+  ``TypeError`` path (``max`` on an ``edge_ids`` tuple that contains a
+  non-``int`` like ``None``).
 - CLAUDE-G24-06: pair check now includes a per-clause variable-set
   signature (catches clause reordering).
 - CLAUDE-G24-07: split ``bool`` vs other-type error messages; float
   message names the type.
+- CLAUDE-G24-08: ``validate_metadata`` converts the ``_check_charges``
+  ``TypeError`` to ``ValueError`` (matches the docstring and
+  ``validate_encoding``); ``encode_tseitin`` keeps ``TypeError`` as the
+  constructor exception.
 """
 
 from __future__ import annotations
@@ -392,9 +398,9 @@ def _check_matched_pair_cnf(
     pair check, not a bug; the regression suite catches it via the
     broader correctness tests in
     ``tests/test_review_pr8_matched_instances.py`` (R8-01 / R8-20), not
-    via the pair assertion.  ``test_r8_14_dee_pair_assertions_miss_a_
-    broken_encoder_that_a3_catches`` pins the class of mutations that
-    **is** caught.
+    via the pair assertion.
+    ``test_r8_14_dee_pair_assertions_now_catch_the_broken_encoder``
+    pins the class of mutations that **is** caught.
     """
     if _clause_length_multiset(even.clauses) != _clause_length_multiset(
         odd.clauses
@@ -422,6 +428,11 @@ def _check_charges(charges: Sequence[int]) -> None:
     ``bool`` is rejected first because ``isinstance(True, int)`` is
     ``True`` and ``True in (0, 1)`` is also ``True``.
     CLAUDE-G24-04.
+
+    Raises ``TypeError`` for a wrong type; ``encode_tseitin`` (the
+    constructor) propagates that.  ``validate_metadata`` converts it to
+    ``ValueError`` (CLAUDE-G24-08) so its public contract is
+    ``ValueError`` for everything it rejects.
     """
     for c in charges:
         if isinstance(c, bool):
@@ -466,7 +477,9 @@ def encode_tseitin(
     ``MAX_DECLARED_VARS``.  Sparse ids are allowed.
 
     Charge contract (CLAUDE-G24-04): charges must be ``int`` (not
-    ``bool``) with values in ``{0, 1}``.
+    ``bool``) with values in ``{0, 1}``.  A wrong type raises
+    ``TypeError``; this is a *constructor* and the caller wrote an
+    argument of the wrong type.
 
     Metadata contract (CLAUDE-R8-09 / M18): keys in
     ``COMPUTED_METADATA_KEYS`` may not be overridden by the caller.
@@ -566,9 +579,18 @@ def validate_encoding(instance: TseitinInstance) -> bool:
     instance with ``n_vars = 6.0`` to ``primal_graph`` or the solvers
     and get a ``TypeError`` downstream.
 
-    Raises ``ValueError`` for value mismatches (including structural
+    Raises ``ValueError`` for value mismatches and for structural
     issues that a hand-built ``TseitinInstance`` could smuggle past the
-    type checks — a non-iterable clause, for example; CLAUDE-G24-05).
+    type checks (CLAUDE-G24-05).  Also raises ``ValueError`` when
+    ``encode_tseitin`` raises ``TypeError`` during the re-encode (the
+    exception is caught and re-raised as ``ValueError``).
+
+    The one remaining path that can raise ``TypeError`` is the
+    ``max(instance.edge_ids)`` call below, when ``instance.edge_ids``
+    contains a value that is not comparable to an ``int`` (e.g.
+    ``None``); that path is recorded as Info in CLAUDE-G24-05 and is
+    left as-is, but is named here so callers that catch only
+    ``ValueError`` are aware of it.
     """
     # 1. n_vars must be an int (not bool).  Without this, downstream
     #    code that does ``range(1, n_vars + 1)`` raises TypeError
@@ -603,6 +625,8 @@ def validate_encoding(instance: TseitinInstance) -> bool:
         ) from exc
 
     # 3. n_vars must equal max(edge_ids), per encode_tseitin.
+    #    (This is the line that can raise TypeError if edge_ids
+    #    contains a non-int; see CLAUDE-G24-05.)
     expected_n_vars = max(instance.edge_ids) if instance.edge_ids else 0
     if instance.n_vars != expected_n_vars:
         raise ValueError(
@@ -639,13 +663,25 @@ def validate_metadata(
     Checks the structural metadata (``family``, ``n_vertices``,
     ``n_edges``), the charge metadata, and — as the last step — re-encodes
     the instance to require clause equality (CLAUDE-R8-05/06).  Also
-    enforces the type contract on ``n_vars`` and ``charges`` via the
-    re-encode path (CLAUDE-G24-01, G24-04).
+    enforces the type contract on ``n_vars`` (via the re-encode) and on
+    ``charges`` (at the top; see CLAUDE-G24-08).
 
     Raises ``ValueError`` on metadata or clause integrity failures, and
-    on type issues that reach the re-encode path (where they are
-    converted to ``ValueError``).
+    on any type problem — including a float or ``bool`` ``charges``
+    entry, whose ``TypeError`` from ``_check_charges`` is converted to
+    ``ValueError`` here so the docstring's promise ("type problems are
+    reported as ``ValueError``") holds.
     """
+    # Type contract for charges (CLAUDE-G24-08).  ``encode_tseitin`` is
+    # a constructor and keeps ``TypeError`` for the same input; this
+    # function is a validator and its docstring promises ``ValueError``
+    # for everything it rejects.  ``validate_encoding`` also raises
+    # ``ValueError`` for the same hand-built instance.  Convert here.
+    try:
+        _check_charges(instance.charges)
+    except TypeError as exc:
+        raise ValueError(str(exc)) from exc
+
     md = instance.metadata if metadata is None else metadata
 
     # Structural metadata (CLAUDE-R8-09 / M16).
@@ -656,9 +692,7 @@ def validate_metadata(
     if md.get("n_edges") != len(instance.graph.edges):
         raise ValueError("n_edges metadata mismatch")
 
-    # Charge metadata.  ``component_charge_parities`` raises ``TypeError``
-    # for non-int charges (G24-04); the caller sees that as the first
-    # signal that something is wrong with a hand-built instance.
+    # Charge metadata.
     expected_sum = sum(instance.charges) % 2
     if md.get("charge_sum_mod2") != expected_sum:
         raise ValueError("charge_sum_mod2 metadata mismatch")
@@ -718,7 +752,7 @@ def generate_matched_tseitin_pair(
     This catches mutations of ``xor3_clauses`` that change which
     variables a clause uses, their total signs, their co-occurrence, or
     their clause position — the class of mutations tested in
-    ``test_r8_14_dee_pair_assertions_miss_a_broken_encoder_that_a3_catches``.
+    ``test_r8_14_dee_pair_assertions_now_catch_the_broken_encoder``.
 
     **Limit (CLAUDE-G24-02).**  A mutation that preserves every checked
     signature still passes.  The canonical example is Claude's
