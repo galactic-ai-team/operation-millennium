@@ -268,7 +268,10 @@ python -m om_lab.width_experiment combine --out $OUT/results.jsonl \
     $OUT/confirmatory_train_results.jsonl $OUT/confirmatory_test_results.jsonl
 python -m om_lab.width_experiment audit $OUT/results.jsonl --splits train test \
     --certificates-dir $OUT/certificates --certificate-manifest $OUT/certificate_manifest.json
-python -m om_lab.analyze_width --records $OUT/results.jsonl --population confirmatory --out-dir $OUT/analysis
+python -m om_lab.analyze_width --records $OUT/results.jsonl --population confirmatory \
+    --stage-a $OUT/freeze/freeze_stage_a.json --stage-b $OUT/freeze/freeze_stage_b.json \
+    --test-run-manifest $OUT/confirmatory_test_run_manifest.json \
+    --combine-manifest $OUT/results_combine_manifest.json --out-dir $OUT/analysis
 ```
 
 The expected training hash assumes Python 3.12 and the pinned versions. Branch counts,
@@ -574,7 +577,9 @@ this batch order; a propagation-only discrepancy does not affect the primary est
   environment it is built in and refuses any later difference.
 - The `freeze` command still writes the schema-1 provenance snapshot, because
   `analyze_width.reproducibility_gates` reads its `source_sha256` and
-  `environment.packages.numpy`; Stage A carries the same two fields.
+  `environment.packages.numpy`; Stage A carries the same two fields, and the
+  official analysis derives them from the verified Stage A instead of from a
+  hand-written manifest (Section 10.11).
 
 ### 10.10 Checks run for this repair
 
@@ -590,3 +595,54 @@ CPython 3.12.3, python-sat 1.9.dev25, numpy 2.5.5), training data only.
   --certificate-manifest --drat-trim`): 0 failures; 863/863 retained proofs accepted by
   `om_lab.proof_check` against their retained CNFs and 863/863 VERIFIED by DRAT-trim.
 - `stage-a` from a checkout with uncommitted changes under `lab/om_lab` is refused.
+
+### 10.11 Analysis authorization interface (ACE-GATE-D-02)
+
+`analyze_width.reproducibility_gates` and `verify_frozen_fit` expect one
+manifest, but execution authorization is two artifacts and neither stage
+alone satisfies the interface: Stage A has no `status` /
+`confirmatory_authorized`, Stage B has no environment or source hashes,
+and neither stage pins `fitted_model_sha256`. The whole-file SHA-256 of
+`fitted_model.json` is not `fit_fingerprint` either, so no single-manifest
+fix works -- a hand-derived manifest passes the reproducibility gate and
+still fails the fitted-model gate. The repair is the trusted analysis
+handoff, `analyze_width.build_analysis_handoff(stage_a_path,
+stage_b_path, *, test_run_manifest_path, combine_manifest_path=None,
+records_path=None, provenance=None, deep_training=True) -> dict`.
+
+It verifies Stage B against Stage A (hash binding plus authorization,
+via `freeze.verify_stage_b`) and Stage A against the running code,
+environment, checkout and training artefacts (via
+`freeze.verify_stage_a`, deep training check by default), and only then
+derives the single-manifest view the gates read (`status`,
+`confirmatory_authorized`, `environment`, `source_sha256`,
+`fitted_model_sha256`). Any failure raises `ValueError`: a forged,
+mismatched or unauthorized input is refused, not analysed. The function
+never writes an authorized artifact and constructs no
+`confirmatory_authorized: true` JSON by hand.
+
+The two fitted-model hashes are kept separate and clearly named in the
+handoff: `fitted_model_sha256` is the `fit_fingerprint` of the frozen
+M0/M1 coefficients, derived from the verified `fitted_model.json`
+(what `verify_frozen_fit` compares), while `fitted_model_file_sha256`
+is Stage A's whole-file SHA-256 of `fitted_model.json` (what pins the
+file bytes). They are not interchangeable.
+
+The combined analysis input is bound to its frozen sources. The test
+run manifest must name this Stage A and Stage B in its `authorization`
+record, name the frozen test schedule, be a complete OFFICIAL run, and
+carry the test output hash; the combine manifest must list the frozen
+training file (Stage A `training.records_sha256`) and that test output
+among its inputs, and its `results_sha256` must be the hash of the
+supplied records file. The handoff carries the whole binding
+(`stage_a_sha256`, `stage_b_sha256`, `training_records_sha256`,
+`test_results_sha256`, `test_run_manifest_sha256`,
+`combine_manifest_sha256`, `records_sha256`, `records_bound`), and
+`analyze_rows` echoes it in the summary under `analysis_handoff`, so
+the output itself shows whether the disposition rested on a verified
+handoff or on a legacy single manifest. The `--reproducibility-manifest`
+flag remains for reviewer and diagnostic use (and for the existing CLI
+regression tests, which analyse fabricated populations that no Stage A
+can be built over); it is not the official path, and it cannot be
+combined with the handoff flags. The official final analysis command
+is step 6 above.

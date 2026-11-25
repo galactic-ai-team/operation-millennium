@@ -1160,6 +1160,340 @@ def reproducibility_gates(frozen: dict | None) -> dict:
     }
 
 
+#: Marker for a manifest derived by :func:`build_analysis_handoff` from a
+#: verified Stage A / Stage B pair (ACE-GATE-D-02). A manifest without this
+#: marker is a legacy single manifest (hand-built or from the old draft
+#: freeze); it still drives the gates above, but the summary records that
+#: no verified handoff was in play (see ``analysis_handoff``).
+HANDOFF_KIND = "OM-C001-R2/analysis-handoff"
+
+
+def _fingerprint_from_stored_model(model: dict) -> str:
+    """``fit_fingerprint`` of the M0/M1 fit stored in a ``fitted_model.json``.
+
+    The stored document serialises the fit's ``(n, m)`` tuple keys as
+    ``"n|m"`` strings (``freeze._jsonable``); they are converted back and
+    the fingerprint is computed with the same :func:`fit_fingerprint` the
+    gate uses, so the pinned value is exactly the fingerprint of the
+    frozen coefficients. Strict: any missing key, malformed cell key or
+    non-finite number raises ``ValueError`` instead of fingerprinting
+    something else.
+    """
+    if not isinstance(model, dict):
+        raise ValueError("fitted model document is not an object")
+    m0_m1 = model.get("m0_m1")
+    if not isinstance(m0_m1, dict):
+        raise ValueError("fitted model document has no m0_m1 fit")
+    expected = {
+        "beta", "slope_denominator", "slope_numerator", "n_train",
+        "width_mean", "width_std", "cell_mean_y", "cell_mean_width",
+    }
+    if set(m0_m1) != expected:
+        raise ValueError("fitted model m0_m1 keys differ from the frozen fit")
+
+    def finite_number(value: object, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"fitted model {name} is not a number")
+        try:
+            ok = math.isfinite(value)
+        except OverflowError:
+            raise ValueError(f"fitted model {name} is not finite")
+        if not ok:
+            raise ValueError(f"fitted model {name} is not finite")
+        return value
+
+    def cell_map(stored: object, name: str) -> dict:
+        if not isinstance(stored, dict):
+            raise ValueError(f"fitted model {name} is not an object")
+        out: dict = {}
+        for key, value in stored.items():
+            parts = key.split("|") if isinstance(key, str) else []
+            if len(parts) != 2 or not all(p.isdigit() for p in parts):
+                raise ValueError(f"fitted model {name} has a malformed cell key {key!r}")
+            out[(int(parts[0]), int(parts[1]))] = finite_number(value, name)
+        return out
+
+    beta = m0_m1["beta"]
+    if beta is not None:
+        finite_number(beta, "beta")
+    n_train = m0_m1["n_train"]
+    if isinstance(n_train, bool) or not isinstance(n_train, int) or n_train <= 0:
+        raise ValueError("fitted model n_train is not a positive int")
+    fit = {
+        "beta": beta,
+        "slope_denominator": finite_number(m0_m1["slope_denominator"], "slope_denominator"),
+        "slope_numerator": finite_number(m0_m1["slope_numerator"], "slope_numerator"),
+        "n_train": n_train,
+        "width_mean": finite_number(m0_m1["width_mean"], "width_mean"),
+        "width_std": finite_number(m0_m1["width_std"], "width_std"),
+        "cell_mean_y": cell_map(m0_m1["cell_mean_y"], "cell_mean_y"),
+        "cell_mean_width": cell_map(m0_m1["cell_mean_width"], "cell_mean_width"),
+    }
+    return fit_fingerprint(fit)
+
+
+def _is_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
+def _resolve_under(base: Path, rel: object) -> Path | None:
+    """Resolve a Stage A relative path, refusing absolute paths and escapes."""
+    if not isinstance(rel, str) or not rel or Path(rel).is_absolute():
+        return None
+    resolved = (base / rel).resolve()
+    try:
+        resolved.relative_to(base.resolve())
+    except ValueError:
+        return None
+    return resolved
+
+
+def build_analysis_handoff(
+    stage_a_path: str | Path,
+    stage_b_path: str | Path,
+    *,
+    test_run_manifest_path: str | Path,
+    combine_manifest_path: str | Path | None = None,
+    records_path: str | Path | None = None,
+    provenance: dict | None = None,
+    deep_training: bool = True,
+) -> dict:
+    """Derive the analysis handoff from a verified Stage A / Stage B pair.
+
+    ACE-GATE-D-02: ``reproducibility_gates`` and ``verify_frozen_fit``
+    expect one manifest, but the execution authorization is two
+    artifacts -- neither stage alone satisfies the interface, and the
+    whole-file SHA-256 of ``fitted_model.json`` is not the fit
+    fingerprint. This function is the only sanctioned way to bridge
+    them: it verifies Stage B against Stage A (hash binding plus
+    authorization, via ``freeze.verify_stage_b``) and Stage A against
+    the running code, environment, checkout and training artefacts
+    (via ``freeze.verify_stage_a``), and only then derives the
+    single-manifest view the gates need. It raises ``ValueError`` on
+    any failure: a forged, mismatched or unauthorized input is
+    refused, not analysed. It never writes an authorized artifact,
+    and it constructs no ``confirmatory_authorized: true`` JSON by
+    hand -- the authorization comes from Stage B, verified.
+
+    The returned dict has the exact shape ``reproducibility_gates``
+    and ``verify_frozen_fit`` read (``status``,
+    ``confirmatory_authorized``, ``environment``, ``source_sha256``,
+    ``fitted_model_sha256``), plus the binding record. The two
+    fitted-model hashes are kept separate and clearly named:
+    ``fitted_model_sha256`` is the ``fit_fingerprint`` of the frozen
+    M0/M1 coefficients (what ``verify_frozen_fit`` compares), while
+    ``fitted_model_file_sha256`` is Stage A's whole-file SHA-256 of
+    ``fitted_model.json`` (what pins the file bytes). They are not
+    interchangeable.
+
+    The combined analysis input is bound to its frozen sources: the
+    test run manifest must name this Stage A and Stage B in its
+    ``authorization`` record and its ``results_sha256`` must be the
+    hash of the test output file; the combine manifest must list the
+    frozen training file (Stage A ``training.records_sha256``) and
+    that test output among its inputs, and -- when ``records_path``
+    is given -- its ``results_sha256`` must be the hash of the
+    supplied records file. ``provenance`` is for tests (a
+    ``freeze.current_provenance`` double); production calls leave it
+    ``None`` for a live snapshot. ``deep_training`` re-verifies the
+    training artefacts inside ``verify_stage_a`` (default True).
+    """
+    # Local import: freeze imports this module lazily (see
+    # freeze.fitted_model_document), so a top-level import would cycle.
+    from om_lab import freeze
+
+    stage_a_path = Path(stage_a_path)
+    stage_b_path = Path(stage_b_path)
+    try:
+        stage_a_bytes, stage_a = freeze.load_json_strict(stage_a_path)
+        stage_b_bytes, stage_b = freeze.load_json_strict(stage_b_path)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read the freeze records: {exc}") from exc
+    stage_a_sha256 = hashlib.sha256(stage_a_bytes).hexdigest()
+    stage_b_sha256 = hashlib.sha256(stage_b_bytes).hexdigest()
+
+    problems = freeze.verify_stage_b(
+        stage_b, stage_a_sha256=stage_a_sha256,
+        stage_a_created_utc=stage_a.get("created_utc") if isinstance(stage_a, dict) else None,
+    )
+    report = freeze.verify_stage_a(
+        stage_a_path, provenance=provenance, deep_training=deep_training
+    )
+    if report["stage_a_sha256"] != stage_a_sha256:
+        problems.append("Stage A changed while it was being verified")
+    problems.extend(report["problems"])
+    if problems:
+        raise ValueError(
+            "analysis handoff refused (Stage A/B verification): " + "; ".join(problems)
+        )
+
+    # The fingerprint is derived from the verified fitted-model file,
+    # whose bytes Stage A pins (whole-file hash) and whose content the
+    # deep check recomputed from the frozen training records.
+    model_rel = stage_a["model"]["path"]
+    model_path = _resolve_under(stage_a_path.parent, model_rel)
+    if model_path is None or not model_path.is_file():
+        raise ValueError("fitted model file is missing or escapes the freeze directory")
+    model_bytes = model_path.read_bytes()
+    if hashlib.sha256(model_bytes).hexdigest() != stage_a["model"]["sha256"]:
+        raise ValueError("fitted model file hash differs from Stage A (a frozen coefficient was changed)")
+    try:
+        model_doc = json.loads(model_bytes.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError(f"fitted model file is not valid JSON: {exc}") from exc
+    fingerprint = _fingerprint_from_stored_model(model_doc)
+
+    # The authorized test-run output: the run manifest must name this
+    # authorization and this schedule, and carry the output hash.
+    try:
+        test_bytes, test_manifest = freeze.load_json_strict(test_run_manifest_path)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"cannot read the test run manifest: {exc}") from exc
+    test_run_manifest_sha256 = hashlib.sha256(test_bytes).hexdigest()
+    test_schedule_sha256 = stage_a["population"]["test"]["schedule_sha256"]
+    binding: list[str] = []
+    if test_manifest.get("experiment") != "OM-C001-R2":
+        binding.append("test run manifest experiment mismatch")
+    if test_manifest.get("population") != "confirmatory":
+        binding.append("test run manifest is not the confirmatory population")
+    if test_manifest.get("split") != "test":
+        binding.append("test run manifest is not the test split")
+    if test_manifest.get("run_mode") != "OFFICIAL":
+        binding.append("test run manifest is not an OFFICIAL run")
+    if test_manifest.get("complete") is not True:
+        binding.append("test run manifest is not complete")
+    if test_manifest.get("schedule_sha256") != test_schedule_sha256:
+        binding.append("test run manifest schedule differs from the frozen test schedule")
+    authorization = test_manifest.get("authorization")
+    if not isinstance(authorization, dict):
+        binding.append("test run manifest carries no authorization record")
+    else:
+        if authorization.get("stage_a_sha256") != stage_a_sha256:
+            binding.append("test run manifest authorises a different Stage A")
+        if authorization.get("stage_b_sha256") != stage_b_sha256:
+            binding.append("test run manifest authorises a different Stage B")
+        if authorization.get("test_schedule_sha256") != test_schedule_sha256:
+            binding.append("test run manifest authorises a different test schedule")
+        if authorization.get("authorized_by") != stage_b["authorized_by"]:
+            binding.append("test run manifest authoriser differs from Stage B")
+        if authorization.get("authorized_at_utc") != stage_b["authorized_at_utc"]:
+            binding.append("test run manifest authorisation time differs from Stage B")
+    test_results_sha256 = test_manifest.get("results_sha256")
+    if not _is_sha256(test_results_sha256):
+        binding.append("test run manifest has no results_sha256")
+    if binding:
+        raise ValueError(
+            "analysis handoff refused (test-run binding): " + "; ".join(binding)
+        )
+
+    # The combined records file, via its combine manifest.
+    combine_manifest_sha256: str | None = None
+    records_sha256: str | None = None
+    records_bound = False
+    if combine_manifest_path is not None:
+        try:
+            combine_bytes, combine = freeze.load_json_strict(combine_manifest_path)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"cannot read the combine manifest: {exc}") from exc
+        combine_manifest_sha256 = hashlib.sha256(combine_bytes).hexdigest()
+        combine_problems: list[str] = []
+        if combine.get("population") != "confirmatory":
+            combine_problems.append("combine manifest is not the confirmatory population")
+        if combine.get("complete") is not True:
+            combine_problems.append("combine manifest is not complete")
+        if not _is_sha256(combine.get("results_sha256")):
+            combine_problems.append("combine manifest has no results_sha256")
+        inputs = combine.get("inputs")
+        if not isinstance(inputs, list) or not all(
+            isinstance(entry, dict) and _is_sha256(entry.get("sha256")) for entry in inputs
+        ):
+            combine_problems.append("combine manifest inputs are missing or malformed")
+        else:
+            input_hashes = {entry["sha256"] for entry in inputs}
+            if stage_a["training"]["records_sha256"] not in input_hashes:
+                combine_problems.append(
+                    "combine manifest inputs do not include the frozen training records"
+                )
+            if test_results_sha256 not in input_hashes:
+                combine_problems.append(
+                    "combine manifest inputs do not include the authorized test output"
+                )
+        if combine_problems:
+            raise ValueError(
+                "analysis handoff refused (combine binding): " + "; ".join(combine_problems)
+            )
+        if records_path is not None:
+            records_bytes = Path(records_path).read_bytes()
+            records_sha256 = hashlib.sha256(records_bytes).hexdigest()
+            if records_sha256 != combine["results_sha256"]:
+                raise ValueError(
+                    "analysis handoff refused: the supplied records file hash "
+                    "differs from the combine manifest"
+                )
+            records_bound = True
+    elif records_path is not None:
+        raise ValueError(
+            "a records file needs its combine manifest to bind it to the "
+            "frozen training records and the authorized test output"
+        )
+
+    return {
+        "kind": HANDOFF_KIND,
+        "status": "FROZEN",
+        "confirmatory_authorized": True,
+        "environment": stage_a["environment"],
+        "source_sha256": stage_a["source_sha256"],
+        # The fingerprint of the frozen M0/M1 coefficients -- what
+        # verify_frozen_fit compares. NOT the file hash below.
+        "fitted_model_sha256": fingerprint,
+        # The whole-file SHA-256 of fitted_model.json -- what pins the
+        # file bytes. NOT the fingerprint above.
+        "fitted_model_file_sha256": stage_a["model"]["sha256"],
+        "stage_a_sha256": stage_a_sha256,
+        "stage_b_sha256": stage_b_sha256,
+        "authorized_by": stage_b["authorized_by"],
+        "authorized_at_utc": stage_b["authorized_at_utc"],
+        "training_records_sha256": stage_a["training"]["records_sha256"],
+        "test_results_sha256": test_results_sha256,
+        "test_run_manifest_sha256": test_run_manifest_sha256,
+        "combine_manifest_sha256": combine_manifest_sha256,
+        "records_sha256": records_sha256,
+        "records_bound": records_bound,
+    }
+
+
+def _handoff_summary(manifest: dict | None) -> dict | None:
+    """Binding record for a verified handoff, else None (legacy manifest).
+
+    Recorded in the analysis summary so the output itself shows
+    whether the disposition rested on a verified Stage A / Stage B
+    handoff or on a legacy single manifest.
+    """
+    if not isinstance(manifest, dict) or manifest.get("kind") != HANDOFF_KIND:
+        return None
+    return {
+        key: manifest.get(key)
+        for key in (
+            "stage_a_sha256",
+            "stage_b_sha256",
+            "authorized_by",
+            "authorized_at_utc",
+            "fitted_model_sha256",
+            "fitted_model_file_sha256",
+            "training_records_sha256",
+            "test_results_sha256",
+            "test_run_manifest_sha256",
+            "combine_manifest_sha256",
+            "records_sha256",
+            "records_bound",
+        )
+    }
+
+
 def analyze_rows(
     rows: list[dict],
     population: str,
@@ -1313,6 +1647,7 @@ def analyze_rows(
         "verification_gates": verification,
         "reproducibility_gates": reproducibility,
         "fitted_model_gate": fitted_model,
+        "analysis_handoff": _handoff_summary(reproducibility_manifest),
         "fit_m0_m1": {
             "beta": fit.get("beta"),
             "slope_denominator": fit.get("slope_denominator"),
@@ -2127,7 +2462,30 @@ def main() -> None:
         "--reproducibility-manifest", type=str, default=None,
         help="Runner freeze manifest JSON to check the reproducibility "
         "gate against (Section 3.10). Without it, the gate is "
-        "unevaluated and a confirmatory disposition is INCONCLUSIVE.",
+        "unevaluated and a confirmatory disposition is INCONCLUSIVE. "
+        "Legacy / diagnostic path: the official confirmatory command "
+        "uses --stage-a / --stage-b / --test-run-manifest / "
+        "--combine-manifest instead (ACE-GATE-D-02).",
+    )
+    parser.add_argument(
+        "--stage-a", type=str, default=None,
+        help="Verified Stage A freeze artifact (freeze_stage_a.json) "
+        "for the official confirmatory analysis handoff.",
+    )
+    parser.add_argument(
+        "--stage-b", type=str, default=None,
+        help="Verified Stage B authorization (freeze_stage_b.json) "
+        "for the official confirmatory analysis handoff.",
+    )
+    parser.add_argument(
+        "--test-run-manifest", type=str, default=None,
+        help="Run manifest of the authorized confirmatory test run "
+        "(confirmatory_test_run_manifest.json).",
+    )
+    parser.add_argument(
+        "--combine-manifest", type=str, default=None,
+        help="Combine manifest of the analysed records file "
+        "(results_combine_manifest.json).",
     )
     parser.add_argument("--out-dir", type=str, default="results")
     args = parser.parse_args()
@@ -2155,7 +2513,40 @@ def main() -> None:
                 "excluded; rerun them with the same instance and budget."
             )
         repro_manifest = None
-        if args.reproducibility_manifest:
+        handoff_flags = (
+            args.stage_a, args.stage_b,
+            args.test_run_manifest, args.combine_manifest,
+        )
+        if args.population == "confirmatory" and any(handoff_flags):
+            # Official path (ACE-GATE-D-02): derive the handoff from
+            # verified Stage A / Stage B; a hand-written manifest is
+            # not accepted alongside it.
+            if not all(handoff_flags):
+                parser.error(
+                    "confirmatory analysis takes --stage-a, --stage-b, "
+                    "--test-run-manifest and --combine-manifest together"
+                )
+            if args.reproducibility_manifest:
+                parser.error(
+                    "confirmatory analysis takes either the Stage A/B "
+                    "handoff or --reproducibility-manifest, not both"
+                )
+            repro_manifest = build_analysis_handoff(
+                args.stage_a, args.stage_b,
+                test_run_manifest_path=args.test_run_manifest,
+                combine_manifest_path=args.combine_manifest,
+                records_path=args.records,
+            )
+            print(
+                "Analysis handoff verified: "
+                f"stage_a={repro_manifest['stage_a_sha256'][:16]}... "
+                f"stage_b={repro_manifest['stage_b_sha256'][:16]}... "
+                f"authorized_by={repro_manifest['authorized_by']} "
+                f"records_bound={repro_manifest['records_bound']}"
+            )
+        elif args.population != "confirmatory" and any(handoff_flags):
+            parser.error("the Stage A/B handoff is confirmatory-only")
+        elif args.reproducibility_manifest:
             with open(args.reproducibility_manifest, encoding="utf-8") as handle:
                 repro_manifest = json.load(handle)
         # Official path (Gate D): strict raw-record types, then
