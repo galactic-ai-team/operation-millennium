@@ -57,3 +57,38 @@ python -m om_lab.analyze_hardness --jsonl results/phase_transition.jsonl --out-d
 > in the harness JSONL schema, so `--jsonl` mode reports them as
 > unavailable; the fresh-sweep mode records them via a separate,
 > labelled direct-PySAT pass.
+
+## Phase 3: Primal Min-Fill Width & OM-C001-R2 Prediction Analysis
+
+`om_lab.width_features` implements the deterministic primal-graph
+min-fill elimination width from Section 3.3 of
+`docs/phase3/DISCOVERY_ROUND_01.md` (preregistration OM-C001-R2),
+with an independent elimination-order replay.
+
+`om_lab.analyze_width` implements the frozen prediction analysis
+from Section 3 of that document exactly: models M0 (per-cell mean)
+and M1 (per-cell mean + one shared within-cell slope on width),
+degree-adjusted secondaries M2/M3, and the paired stratified
+bootstrap (10,000 replicates, seed 9012026). It writes
+`width_analysis.json`, `primary_result.json` (one machine-readable
+disposition: PASS / FAIL / INCONCLUSIVE), `per_cell.csv`, and
+per-cell plots.
+
+```bash
+# Validate the machinery on a small pilot population (pilot seeds --
+# never the confirmatory seeds)
+python -m om_lab.analyze_width --pilot --out-dir results/width-pilot
+
+# Analyse runner records (Claude's frozen runner) once Lumi has
+# authorised confirmatory execution
+python -m om_lab.analyze_width --records results.jsonl --population confirmatory --out-dir results/width
+```
+
+> **Freeze warning:** the confirmatory population (Section 3.5,
+> seed material `OM-C001-R2|n|A|i`) must only be run after Lumi
+> freezes the implementation and authorises confirmatory execution.
+> This script has no confirmatory-generation mode. A pilot or
+> synthetic run is INCONCLUSIVE as a primary disposition by
+> construction. UNSAT rows without a proof certificate fail the
+> verification gate (Section 4.1); solver agreement alone is not
+> proof evidence.

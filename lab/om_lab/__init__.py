@@ -19,11 +19,17 @@ from om_lab.solvers import (
     solve_pysat,
     verify_cnf_assignment,
 )
+from om_lab.width_features import (
+    MinFillResult,
+    primal_min_fill_width,
+    replay_elimination_order,
+)
 
 __all__ = [
     "CNFInstance",
     "CNFFeatures",
     "GraphColoringInstance",
+    "MinFillResult",
     "TSPInstance",
     "SolveResult",
     "extract_features",
@@ -31,6 +37,8 @@ __all__ = [
     "generate_random_3sat",
     "generate_graph_coloring",
     "generate_tsp",
+    "primal_min_fill_width",
+    "replay_elimination_order",
     "solve_dpll",
     "solve_pysat",
     "verify_cnf_assignment",
