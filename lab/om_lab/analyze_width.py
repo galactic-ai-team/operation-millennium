@@ -125,7 +125,16 @@ A_VALUES = [380, 400, 420, 426, 440, 460, 500]
 BUDGET_B = 10000
 BOOTSTRAP_REPLICATES = 10000
 BOOTSTRAP_SEED = 9012026
+#: Rows resampled per test cell in the paired stratified bootstrap
+#: (Section 3.10: fixed 30, regardless of the cell's size).
+BOOTSTRAP_ROWS_PER_CELL = 30
 EFFECT_THRESHOLD = 0.05
+#: Documented upper bound for Phase 1 seeds. Phase 1 used small
+#: integer seeds (base-2026 scheme); the scheme's exact maximum is
+#: 2026 + 10*10_000 + 100 = 102126, well below this bound. Both
+#: phase-1 checks in check_seed_manifest derive from this one
+#: constant (DEE-R9-05, DEE-R9-20).
+PHASE1_SEED_MAX = 10_000_000
 TRAIN_INDEX_MAX = 69  # indices 0..69 are training
 TEST_INDEX_MIN = 70  # indices 70..99 are confirmatory test
 CONFIRMATORY_SEED_PREFIX = "OM-C001-R2"
@@ -194,19 +203,18 @@ def check_seed_manifest(manifest: list[dict]) -> dict:
     """Collision / Phase-1-overlap checks for a seed manifest.
 
     Phase 1 experiments used small integer seeds (base 2026 scheme,
-    all below 10**7); confirmatory seeds are 128-bit SHA-256 outputs,
-    so the two populations are disjoint by construction. This is
-    checked, not assumed.
+    all below PHASE1_SEED_MAX); confirmatory seeds are 128-bit
+    SHA-256 outputs, so the two populations are disjoint by
+    construction. This is checked, not assumed.
     """
     seeds = [row["seed"] for row in manifest]
-    phase1_max = 2026 + 10 * 10_000 + 100
     return {
         "n_rows": len(manifest),
         "n_distinct_seeds": len(set(seeds)),
         "has_collision": len(set(seeds)) != len(seeds),
         "min_seed": min(seeds) if seeds else None,
-        "phase1_seeds_below_10m": all(s < 10_000_000 for s in seeds) is False,
-        "disjoint_from_phase1_scheme": all(s > phase1_max for s in seeds),
+        "phase1_seeds_below_10m": all(s < PHASE1_SEED_MAX for s in seeds),
+        "disjoint_from_phase1_scheme": all(s > PHASE1_SEED_MAX for s in seeds),
     }
 
 
@@ -257,8 +265,10 @@ def make_row(
     ``verification_status`` follows Section 4.1 when supplied;
     otherwise it is derived honestly: SAT with a checked witness is
     ``SAT_WITNESS_CHECKED``; UNSAT without a proof certificate is
-    ``UNSAT_SOLVER_AGREEMENT_ONLY`` (not proof evidence); UNKNOWN is
-    ``NOT_APPLICABLE`` (no satisfiability claim is made).
+    ``UNVERIFIED`` -- no second solver ran, so there is no agreement
+    to report (a lone DPLL UNSAT is not evidence; see
+    REVIEW_PR10_NOVA.md NOVA-R10-13); UNKNOWN is ``NOT_APPLICABLE``
+    (no satisfiability claim is made).
     """
     status = status_from_solver(satisfiable, timed_out)
     if verification_status is None:
@@ -267,7 +277,7 @@ def make_row(
                 "SAT_WITNESS_CHECKED" if verified else "INVALID"
             )
         elif status == "UNSAT":
-            verification_status = "UNSAT_SOLVER_AGREEMENT_ONLY"
+            verification_status = "UNVERIFIED"
         else:
             verification_status = "NOT_APPLICABLE"
     return {
@@ -415,7 +425,13 @@ def fit_degree_adjusted(train_rows: list[dict]) -> dict:
     degree. M3: cell effects + joint least-squares slopes on centred
     degree and centred width (2x2 normal equations). A singular
     system is reported as such; it is not repaired by dropping a
-    feature post hoc.
+    feature post hoc. M3 is treated as singular unless the relative
+    determinant exceeds 1e-12 (rel_det = det / (sdd*sww) = 1 -
+    (within-cell correlation)^2). That threshold is an
+    implementation choice, not a prereg constant (it appears in no
+    section of DISCOVERY_ROUND_01); it guards the 2x2 solve against
+    near-collinear degree and width, whose slope estimates blow up
+    as rel_det -> 0 (DEE-R9-03).
     """
     sums = _within_cell_centered_sums(train_rows, "degree_mean", "width")
     sdd = sums["Sdegree_meandegree_mean"]
@@ -510,7 +526,11 @@ def evaluate(
     """Held-out MAE for M0/M1/M2/M3 and per-cell summaries.
 
     Models are fixed inputs; this function fits nothing. M2/M3 are
-    reported as None when their slopes are unidentifiable.
+    reported as None when their slopes are unidentifiable. Overall
+    MAEs are equal-cell-weighted (Section 3.10: "Retain equal cell
+    weights"): the mean of the per-cell MAEs, not the mean over all
+    test rows (DEE-R9-17). For the frozen confirmatory population
+    every test cell has exactly 30 rows, so the two coincide.
     """
     if not test_rows:
         raise ValueError("no test rows to evaluate")
@@ -542,17 +562,6 @@ def evaluate(
                 "err_m3": abs(y - p3) if p3 is not None else None,
             }
         )
-
-    def _mae(key: str) -> float | None:
-        vals = [r[key] for r in paired if r[key] is not None]
-        return statistics.fmean(vals) if vals else None
-
-    mae0 = _mae("err_m0")
-    mae1 = _mae("err_m1")
-    mae2 = _mae("err_m2")
-    mae3 = _mae("err_m3")
-    assert mae0 is not None and mae1 is not None
-    improvement = 1 - mae1 / mae0 if mae0 != 0 else None
 
     by_cell: dict[tuple[int, int], list[dict]] = defaultdict(list)
     for r in paired:
@@ -597,6 +606,15 @@ def evaluate(
                 ),
             }
         )
+    # Equal-cell-weighted overall MAEs (DEE-R9-17): the mean of the
+    # per-cell MAEs. Cells with no identifiable M2/M3 slope are
+    # skipped for those models.
+    mae0 = statistics.fmean([c["mae_m0"] for c in per_cell])
+    mae1 = statistics.fmean([c["mae_m1"] for c in per_cell])
+    mae2 = _mae_cell(per_cell, "mae_m2")
+    mae3 = _mae_cell(per_cell, "mae_m3")
+    assert mae0 is not None and mae1 is not None
+    improvement = 1 - mae1 / mae0 if mae0 != 0 else None
     return {
         "n_test": len(paired),
         "mae_m0": mae0,
@@ -626,10 +644,14 @@ def paired_stratified_bootstrap(
 ) -> dict:
     """Paired, stratified percentile bootstrap of the improvement.
 
-    Within each test cell, sample that cell's rows with replacement
-    (same cell size), resampling the paired (M0, M1) errors together.
-    Fitted models are fixed; only the test sample is resampled.
-    Percentiles use linear interpolation (NumPy default).
+    Within each test cell, sample exactly BOOTSTRAP_ROWS_PER_CELL
+    (30, Section 3.10: fixed size, regardless of the cell's size)
+    rows with replacement, resampling the paired (M0, M1) errors
+    together. The replicate improvement is 1 - MAE1 / MAE0 with the
+    MAEs equal-cell-weighted (mean of per-cell MAEs), matching
+    evaluate() (DEE-R9-17). Fitted models are fixed; only the test
+    sample is resampled. Percentiles use linear interpolation
+    (NumPy default).
     """
     by_cell: dict[tuple[int, int], list[dict]] = defaultdict(list)
     for r in paired_rows:
@@ -639,18 +661,19 @@ def paired_stratified_bootstrap(
     improvements: list[float] = []
     n_undefined = 0
     for _ in range(replicates):
-        total_err0 = 0.0
-        total_err1 = 0.0
-        total_n = 0
+        mae0_sum = 0.0
+        mae1_sum = 0.0
         for cell in cells:
             rows = by_cell[cell]
-            idx = rng.integers(0, len(rows), size=len(rows))
-            for j in idx:
-                total_err0 += rows[int(j)]["err_m0"]
-                total_err1 += rows[int(j)]["err_m1"]
-            total_n += len(rows)
-        mae0 = total_err0 / total_n
-        mae1 = total_err1 / total_n
+            idx = rng.integers(0, len(rows), size=BOOTSTRAP_ROWS_PER_CELL)
+            mae0_sum += (
+                sum(rows[int(j)]["err_m0"] for j in idx) / BOOTSTRAP_ROWS_PER_CELL
+            )
+            mae1_sum += (
+                sum(rows[int(j)]["err_m1"] for j in idx) / BOOTSTRAP_ROWS_PER_CELL
+            )
+        mae0 = mae0_sum / len(cells)
+        mae1 = mae1_sum / len(cells)
         if mae0 == 0:
             n_undefined += 1
             continue
@@ -707,21 +730,27 @@ def integrity_gates(
     if missing_train:
         failures.append(f"test cells with no training rows: {sorted(missing_train)}")
     for r in rows:
+        # An ERROR row (or a malformed record) carries None for y /
+        # decisions / width; report it as a failure instead of
+        # crashing on float(None) (DEE-R9-04). The row is skipped for
+        # the numeric checks below.
+        none_fields = [k for k in ("y", "decisions", "width") if r.get(k) is None]
+        if none_fields:
+            failures.append(
+                f"row {r.get('index')}: None {', '.join(none_fields)} "
+                "(ERROR row or malformed record)"
+            )
+            continue
         if not (0.0 <= float(r["y"]) <= math.log1p(budget) + 1e-12):
             failures.append(f"Y out of range in row {r.get('index')}")
-            break
         if int(r["width"]) < 0 or int(r["decisions"]) < 0:
             failures.append("negative width or decisions")
-            break
         if r["timed_out"] and r["status"] != "UNKNOWN":
             failures.append("budget-exhausted row not labelled UNKNOWN")
-            break
         if r["status"] == "SAT" and not r.get("verified"):
             failures.append("SAT row without a checked witness (INVALID)")
-            break
         if r["status"] == "UNKNOWN" and r.get("satisfiable"):
             failures.append("UNKNOWN row claims satisfiable=True")
-            break
     seeds = [r.get("seed") for r in rows if r.get("seed") is not None]
     if len(set(seeds)) != len(seeds):
         failures.append("duplicate seeds within the population")
@@ -794,6 +823,8 @@ def primary_disposition(
     gates: dict,
     verification: dict,
     fit: dict,
+    reproducibility: dict | None = None,
+    eval_error: str | None = None,
 ) -> dict:
     """One machine-readable primary disposition (Section 3.10).
 
@@ -801,16 +832,29 @@ def primary_disposition(
     bootstrap interval's lower endpoint > 0. FAIL is point
     improvement < 5% with gates passing. Everything else is
     INCONCLUSIVE. The effort-only disposition (ignoring the
-    verification gate) is reported separately so the signal is not
-    hidden when verification is the blocker.
+    verification gate, but still requiring the integrity gates) is
+    reported separately so the signal is not hidden when verification
+    is the blocker. A reproducibility gate that was not evaluated or
+    that failed also forces INCONCLUSIVE (Section 3.10, DEE-R9-18).
     """
     reasons: list[str] = []
     if not gates["passed"]:
         reasons.extend(gates["failures"])
     if not verification["passed"]:
         reasons.extend(verification["failures"])
+    if reproducibility is not None:
+        if not reproducibility.get("evaluated"):
+            reasons.append(
+                "reproducibility gate not evaluated (no manifest supplied)"
+            )
+        elif not reproducibility.get("passed"):
+            reasons.extend(reproducibility.get("failures", []))
     effort_only: str | None = None
-    if evaluation is not None and evaluation["improvement"] is not None:
+    if not gates["passed"]:
+        # The effort signal cannot be trusted when the data itself
+        # fails an integrity gate (DEE-R9-19).
+        effort_only = "INCONCLUSIVE"
+    elif evaluation is not None and evaluation["improvement"] is not None:
         effort_only = (
             "PASS" if evaluation["improvement"] >= EFFECT_THRESHOLD else "FAIL"
         )
@@ -848,9 +892,17 @@ def primary_disposition(
             disposition = "FAIL"
         else:
             disposition = "INCONCLUSIVE"
-            reasons.append(
-                "point improvement >= 5% but bootstrap interval includes zero"
-            )
+            if bootstrap is None:
+                # The interval is unavailable, not "including zero"
+                # (DEE-R9-02).
+                reasons.append(
+                    "bootstrap unavailable"
+                    + (f": {eval_error}" if eval_error else "")
+                )
+            else:
+                reasons.append(
+                    "point improvement >= 5% but bootstrap interval includes zero"
+                )
     else:
         disposition = "INCONCLUSIVE"
     return {
@@ -906,12 +958,66 @@ def _reproducibility(population: str) -> dict:
     }
 
 
+def reproducibility_gates(frozen: dict | None) -> dict:
+    """Pass/fail reproducibility gate (Section 3.10, DEE-R9-18).
+
+    Compares the current NumPy version and the SHA-256 of the five
+    source files this analysis depends on against a frozen manifest:
+    the runner's freeze manifest JSON (see
+    ``width_experiment.draft_freeze_manifest``), which carries
+    ``environment.packages.numpy`` and ``source_sha256``. Only the
+    files this analysis depends on are compared; extra files in the
+    frozen manifest (e.g. the proof checker) are the runner's
+    business, not this analysis's. ``frozen is None`` means the gate
+    was not evaluated: that is a failure, not a pass -- a
+    confirmatory disposition must never rest on an unevaluated gate.
+    """
+    current = _reproducibility("confirmatory")
+    checked = {
+        "numpy_version": current["numpy_version"],
+        "source_sha256": current["source_file_sha256"],
+    }
+    if frozen is None:
+        return {
+            "evaluated": False,
+            "passed": False,
+            "failures": ["no reproducibility manifest supplied; gate not evaluated"],
+            "checked": checked,
+        }
+    failures: list[str] = []
+    packages = (frozen.get("environment") or {}).get("packages") or {}
+    frozen_numpy = packages.get("numpy")
+    if frozen_numpy is None:
+        failures.append("frozen manifest has no numpy version")
+    elif frozen_numpy != current["numpy_version"]:
+        failures.append(
+            f"numpy version differs: frozen {frozen_numpy} vs "
+            f"current {current['numpy_version']}"
+        )
+    frozen_hashes = frozen.get("source_sha256") or {}
+    if not frozen_hashes:
+        failures.append("frozen manifest has no source hashes")
+    else:
+        for name, digest in current["source_file_sha256"].items():
+            if name not in frozen_hashes:
+                failures.append(f"frozen manifest lacks source hash for {name}")
+            elif frozen_hashes[name] != digest:
+                failures.append(f"source hash differs for {name}")
+    return {
+        "evaluated": True,
+        "passed": not failures,
+        "failures": failures,
+        "checked": checked,
+    }
+
+
 def analyze_rows(
     rows: list[dict],
     population: str,
     bootstrap_replicates: int = BOOTSTRAP_REPLICATES,
     bootstrap_seed: int = BOOTSTRAP_SEED,
     budget: int = BUDGET_B,
+    reproducibility_manifest: dict | None = None,
 ) -> dict:
     """Run the frozen OM-C001-R2 analysis over already-built rows.
 
@@ -921,13 +1027,23 @@ def analyze_rows(
     confirmatory test has not been run); the effort statistics are
     still computed and reported so the machinery can be validated.
     No feature is selected, tuned, or changed based on these rows.
+    ERROR rows are excluded as missing data, mirroring
+    records_to_rows, and counted (DEE-R9-04).
+    ``reproducibility_manifest`` is the runner's freeze manifest
+    JSON, or None to leave the reproducibility gate unevaluated --
+    which forces INCONCLUSIVE for the confirmatory population
+    (DEE-R9-18).
     """
     if population not in {"confirmatory", "pilot", "synthetic"}:
         raise ValueError(f"unknown population {population!r}")
+    n_error_rows = sum(1 for r in rows if r.get("status") == "ERROR")
+    if n_error_rows:
+        rows = [r for r in rows if r.get("status") != "ERROR"]
     train_rows = [r for r in rows if r["split"] == "train"]
     test_rows = [r for r in rows if r["split"] == "test"]
     gates = integrity_gates(rows, population, budget=budget)
     verification = verification_gates(rows)
+    reproducibility = reproducibility_gates(reproducibility_manifest)
     fit = fit_m0_m1(train_rows) if train_rows else {"beta": None}
     fit_deg = fit_degree_adjusted(train_rows) if train_rows else {}
     evaluation: dict | None = None
@@ -957,7 +1073,8 @@ def analyze_rows(
         except (ValueError, KeyError) as exc:
             eval_error = str(exc)
     disposition = primary_disposition(
-        evaluation, bootstrap, gates, verification, fit
+        evaluation, bootstrap, gates, verification, fit,
+        reproducibility=reproducibility, eval_error=eval_error,
     )
     if population != "confirmatory":
         disposition = {
@@ -1025,9 +1142,11 @@ def analyze_rows(
             "n_test": len(test_rows),
             "n_cells_train": len({_cell_key(r) for r in train_rows}),
             "n_cells_test": len({_cell_key(r) for r in test_rows}),
+            "n_error_rows": n_error_rows,
         },
         "integrity_gates": gates,
         "verification_gates": verification,
+        "reproducibility_gates": reproducibility,
         "fit_m0_m1": {
             "beta": fit.get("beta"),
             "slope_denominator": fit.get("slope_denominator"),
@@ -1458,6 +1577,12 @@ def main() -> None:
     parser.add_argument(
         "--pilot-a-values", type=int, nargs="+", default=[400, 426, 460],
     )
+    parser.add_argument(
+        "--reproducibility-manifest", type=str, default=None,
+        help="Runner freeze manifest JSON to check the reproducibility "
+        "gate against (Section 3.10). Without it, the gate is "
+        "unevaluated and a confirmatory disposition is INCONCLUSIVE.",
+    )
     parser.add_argument("--out-dir", type=str, default="results")
     args = parser.parse_args()
 
@@ -1487,7 +1612,11 @@ def main() -> None:
     else:
         parser.error("specify --pilot or --records")
 
-    summary = analyze_rows(rows, population)
+    repro_manifest = None
+    if args.reproducibility_manifest:
+        with open(args.reproducibility_manifest, encoding="utf-8") as handle:
+            repro_manifest = json.load(handle)
+    summary = analyze_rows(rows, population, reproducibility_manifest=repro_manifest)
     # Plot points (width, y, status) for held-out rows.
     evaluation_paired = None
     if summary["evaluation"] is not None:
