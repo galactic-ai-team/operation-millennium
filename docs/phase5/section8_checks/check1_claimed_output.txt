@@ -1,0 +1,26 @@
+=== F1_star_K1_5_root_leaf ===
+  n=6, |E|=5, |bridges|=5, |X|=6, |T(G,c)|=21
+  With weakening:    DAG=11, used_ax=6, tree=11, width=5, regular=True
+  Without weakening: DAG=11, used_ax=6, tree=11, width=5, regular=True
+=== F2_dipole_chain_3_shared_v ===
+  n=6, |E|=8, |bridges|=2, |X|=3, |T(G,c)|=22
+  With weakening:    DAG=29, used_ax=12, tree=67, width=4, regular=True
+  Without weakening: DAG=25, used_ax=12, tree=55, width=4, regular=True
+=== F3a_k3_6leaves_root_K3 ===
+  n=9, |E|=9, |bridges|=6, |X|=7, |T(G,c)|=138
+  With weakening:    DAG=29, used_ax=12, tree=35, width=8, regular=True
+  Without weakening: DAG=29, used_ax=12, tree=35, width=8, regular=True
+=== F3b_k3_6leaves_root_leaf ===
+  n=9, |E|=9, |bridges|=6, |X|=7, |T(G,c)|=138
+  With weakening:    DAG=32, used_ax=12, tree=37, width=8, regular=True
+  Without weakening: DAG=28, used_ax=12, tree=33, width=8, regular=True
+=== F4_branching_K4_K3_B3_sing_B2 ===
+  n=12, |E|=18, |bridges|=4, |X|=5, |T(G,c)|=56
+  With weakening:    DAG=104, used_ax=35, tree=447, width=4, regular=True
+  Without weakening: DAG=94, used_ax=35, tree=367, width=4, regular=True
+=== F2_long_dipole_chain_8 ===
+  n=16, |E|=23, |bridges|=7, |X|=8, |T(G,c)|=60
+  With weakening:    DAG=84, used_ax=32, tree=2547, width=3, regular=True
+  Without weakening: DAG=70, used_ax=32, tree=2039, width=3, regular=True
+
+
