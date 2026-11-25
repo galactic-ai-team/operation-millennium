@@ -16,6 +16,7 @@ Findings are also written up in docs/phase4/reviews/REVIEW_PR10_NOVA.md.
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -125,7 +126,7 @@ def test_freeze_missing_file_refused(tmp_path):
     [
         ("status-left-draft", lambda m: m.update(status="DRAFT")),
         ("authorized-at-null", lambda m: m.update(authorized_at_utc=None)),
-        ("python-patch-differs", lambda m: m["environment"].update(python_version="3.12.9")),
+        ("python-patch-differs", lambda m: m["environment"].update(python_version="%d.%d.999" % sys.version_info[:2])),
         ("python-implementation-pypy", lambda m: m["environment"].update(python_implementation="PyPy")),
         ("platform-differs", lambda m: m["environment"].update(platform="other-platform-1.2.3")),
         ("matplotlib-version", lambda m: m["environment"]["packages"].update(matplotlib="0.0.0")),
