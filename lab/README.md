@@ -92,3 +92,36 @@ python -m om_lab.analyze_width --records results.jsonl --population confirmatory
 > construction. UNSAT rows without a proof certificate fail the
 > verification gate (Section 4.1); solver agreement alone is not
 > proof evidence.
+
+## Phase 3: OM-C001-R2 Experiment Runner & UNSAT Certificates
+
+`om_lab.width_experiment` is the frozen OM-C001-R2 runner (Section 7.1
+of `docs/phase3/DISCOVERY_ROUND_01.md`). It builds the preregistered
+population from the SHA-256 seed scheme and runs the unchanged DPLL
+baseline (`max_decisions=10000`, `max_seconds=None`). For every
+instance it writes exactly one deterministic primary record, and it
+certifies each UNSAT claim with a CaDiCaL (`cd195`) DRAT proof that
+the independent checker `om_lab.proof_check` (standard library only)
+has validated. Infrastructure failures are rerun with the same instance
+and budget. The confirmatory test split is refused without an
+authorised freeze manifest.
+
+Solver results now carry an explicit `status` (SAT / UNSAT / UNKNOWN /
+ERROR) and a Section 4.1 `verification_status`. `verified` is True only
+for an independently checked claim, so an UNSAT result without a checked
+certificate is `UNVERIFIED`. Use `solve_pysat(..., certify=True)` to
+obtain `UNSAT_PROOF_CHECKED`.
+
+```bash
+python -m om_lab.width_experiment smoke --out-dir results/om_c001_r2/smoke
+python -m om_lab.width_experiment run --split train --out-dir results/om_c001_r2 --workers 4
+python -m om_lab.width_experiment audit results/om_c001_r2/confirmatory_train_results.jsonl --splits train --recheck-certificates
+python -m om_lab.width_experiment freeze --out results/om_c001_r2/freeze.json   # DRAFT for Lumi
+```
+
+Full specification, commands, infrastructure results and claim levels:
+`docs/phase3/OM-C001-R2_RUNNER.md`.
+
+> **Honesty Rule reminder:** runner output is `[Claim Level: Empirical
+> Observation]`. A checked certificate shows that one formula is UNSAT.
+> It says nothing about worst-case complexity.

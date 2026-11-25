@@ -1,0 +1,24 @@
+# OM-C001-R2 pinned environment (proposal for Lumi's freeze; Section 3.5 "Pin dependency versions").
+# These are the exact versions Claude used for the infrastructure runs reported in
+# docs/phase3/OM-C001-R2_RUNNER.md (Python 3.12.3, Linux x86_64). lab/requirements.txt keeps
+# open ">=" ranges; install with:
+#   pip install -r lab/requirements.txt -c lab/constraints-om-c001-r2.txt
+# The runner's confirmatory guard compares python-sat and numpy versions (and Python
+# major.minor) against the authorised freeze manifest, so the freeze must be generated
+# in the same environment that will execute the confirmatory split.
+python-sat==1.9.dev25
+numpy==2.5.5
+matplotlib==3.11.2
+pytest==9.2.0
+contourpy==1.4.0
+cycler==0.12.1
+fonttools==4.68.0
+kiwisolver==1.5.1
+packaging==26.4
+pillow==13.0.0
+pyparsing==3.3.3
+python-dateutil==4.0.0
+six==1.17.0
+iniconfig==2.3.1
+pluggy==1.7.0
+Pygments==2.21.0
