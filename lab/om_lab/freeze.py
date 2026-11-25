@@ -1039,7 +1039,7 @@ def verify_for_execution(
         _refuse(["the confirmatory test split requires --stage-a and --stage-b (authorised freeze)"])
     try:
         stage_a_bytes = Path(stage_a_path).read_bytes()
-        _, stage_b = load_json_strict(stage_b_path)
+        stage_b_bytes, stage_b = load_json_strict(stage_b_path)
     except (OSError, ValueError) as exc:
         _refuse([f"cannot read the freeze records: {exc}"])
     stage_a_sha = _sha256_bytes(stage_a_bytes)
@@ -1051,6 +1051,14 @@ def verify_for_execution(
     report = verify_stage_a(stage_a_path, provenance=provenance, deep_training=deep_training)
     if report["stage_a_sha256"] != stage_a_sha:
         problems.append("Stage A changed while it was being verified")
+    # The authorisation (and the run manifest the analysis handoff binds to)
+    # names the Stage B bytes verified above, so they must still be on disk.
+    try:
+        stage_b_unchanged = Path(stage_b_path).read_bytes() == stage_b_bytes
+    except OSError:
+        stage_b_unchanged = False
+    if not stage_b_unchanged:
+        problems.append("Stage B changed while it was being verified")
     problems.extend(report["problems"])
     requested = dict(requested_settings)
     if _is_int(requested.get("watchdog_s")):
@@ -1064,7 +1072,7 @@ def verify_for_execution(
     head = report.get("head_commit")
     authorization = AuthorizedFreeze(
         stage_a_path=str(stage_a_path), stage_a_sha256=stage_a_sha,
-        stage_b_path=str(stage_b_path), stage_b_sha256=_sha256_file(Path(stage_b_path)),
+        stage_b_path=str(stage_b_path), stage_b_sha256=_sha256_bytes(stage_b_bytes),
         authorized_by=stage_b["authorized_by"], authorized_at_utc=stage_b["authorized_at_utc"],
         execution_commit=stage_a["code"]["commit"], head_commit=head or "",
         verified_at_utc=utc_now(), test_schedule_sha256=stage_a["population"]["test"]["schedule_sha256"],

@@ -344,6 +344,25 @@ def test_missing_freeze_records_refused(case):
         case.verify(deep_training=False)
 
 
+def test_authorisation_names_the_stage_b_bytes_that_were_verified(case, monkeypatch):
+    # ACE-GATE-D-02, runner side: the analysis handoff binds the test run to
+    # the run manifest's authorization.stage_b_sha256, so it must be the hash
+    # of the Stage B bytes that were verified, and a Stage B replaced while
+    # verification runs must stop the run.
+    verified = case.stage_b.read_bytes()
+    auth = case.verify(deep_training=False)
+    assert auth.stage_b_sha256 == sha256_file(case.stage_b) == freeze._sha256_bytes(verified)
+    real_verify_stage_a = freeze.verify_stage_a
+
+    def replace_stage_b_during_verification(*args, **kwargs):
+        case.stage_b.write_bytes(b"{}\n")  # not an authorisation
+        return real_verify_stage_a(*args, **kwargs)
+
+    monkeypatch.setattr(freeze, "verify_stage_a", replace_stage_b_during_verification)
+    with pytest.raises(REFUSED, match="Stage B changed while it was being verified"):
+        case.verify(deep_training=False)
+
+
 # ---------------------------------------------------------------------------
 # Ace section 5: the running environment drifts after the freeze
 # (Python patch version, pinned dependency, dirty tree, changed code)
