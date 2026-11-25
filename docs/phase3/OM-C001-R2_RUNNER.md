@@ -5,6 +5,11 @@ Coordinator: Lumi · Research Director: Stephon
 Date: 2026-11-25 · Base: `dev` @ `ed6d557`
 Assignment: `docs/phase3/DISCOVERY_ROUND_01.md` Section 7.1
 
+**Updated 2026-11-25 for the Phase 4 Gate B/D repair (base `dev` @ `b6d2b27`).** The
+single-file freeze is replaced by the two-stage freeze, the non-executing preflight
+and one production entrypoint (Section 10). Sections 4, 6 and 7 are updated to match;
+Sections 1-3 and 5 are the original report.
+
 **Status: implementation delivered for review. Not frozen. No confirmatory test-split
 instance (indices 70–99) has been solved by Claude.** Nothing in this document is a
 statement about whether width predicts solver effort; no predictive statistic (slope,
@@ -127,27 +132,40 @@ It is not used by the random 3-SAT experiment.
   - Crashes and exceptions are infrastructure failures, rerun with the **same instance and budget** (default up to 3 attempts).
   - An instance that never succeeds gets one `status="ERROR"` record (`y=null`, `decisions=null`): missing data, never UNKNOWN or UNSAT.
   - Nova's `records_to_rows` now excludes ERROR rows, so the confirmatory integrity gate reports the missing row (→ INCONCLUSIVE).
-- **Confirmatory boundary.** `run --split test` (confirmatory population) is refused unless `--freeze` points to a manifest with:
-  - `confirmatory_authorized: true` and a non-empty `authorized_by`;
-  - matching source hashes, function hashes, checker hash, seed-manifest hash and protocol constants;
-  - the same Python major.minor and python-sat/numpy versions.
-
-  `freeze` only ever writes a DRAFT with `confirmatory_authorized: false`. The guard also refuses fault injection, a non-frozen budget, and `--no-certify` for the confirmatory population. It is a procedural guard against accidental unblinding, not cryptographic blinding (Section 3.5).
-- **Integrity report** (run, combine and audit). Checks:
+- **Confirmatory boundary (updated, Section 10).** `run --split test` (confirmatory
+  population) runs only with a Stage A freeze manifest and Lumi's Stage B
+  authorisation (`--stage-a`, `--stage-b`). Both are re-verified against the running
+  code, checkout, interpreter, dependency inventory, documents, training records,
+  fitted model and requested settings, and the run schedules exactly the frozen
+  840-instance test population. The single-file `freeze` manifest (schema 1) no
+  longer authorises anything. Fault injection, a non-frozen budget and `--no-certify`
+  are refused for the confirmatory population, at every execution layer. It is a
+  procedural guard against accidental unblinding, not cryptographic blinding
+  (Section 3.5, ACE-PLAN-06).
+- **Integrity report** (run, combine, audit and the freeze). Checks:
   - one record per instance, with identity fields matching the seed scheme;
+  - strict JSON types (a malformed record is reported as a failure, never a crash);
   - UNKNOWN rows make no claim and have `D = B` and `Y = ln(1+B)`;
   - completed rows have `D < B` and `Y = ln(1+D)`;
-  - SAT rows are witness-checked, and no UNSAT row is INVALID;
+  - the evidence behind every claim, not the stored status (Section 10.5): the
+    formula is regenerated and its hash compared, every SAT model is re-verified,
+    and every `UNSAT_PROOF_CHECKED` claim needs a VALID certificate summary from this
+    checker;
   - `verified` is consistent with `verification_status`, and width equals its replay;
   - no integrity alarms are set.
 
-  `verification_gate_ready` is true only if every UNSAT row is certified and there are no INVALID or ERROR rows.
+  `verification_gate_ready` is true only if every UNSAT row is certified and there are
+  no INVALID or ERROR rows. `complete` says whether the records are the full population.
 - **Audit (for Lumi's independent verification).** `audit` re-verifies a results file:
-  - regenerates every formula from its seed and checks `formula_sha256`;
-  - re-checks every stored SAT model against the regenerated formula;
+  - the integrity report above (formula hashes, SAT models, certificate summaries);
+  - with `--certificates-dir` and `--certificate-manifest`, the retained `.cnf` and
+    `.drat` files themselves (Section 10.6); required for a passing confirmatory audit;
   - with `--recompute-features`, recomputes width and degree;
-  - with `--recheck-certificates`, regenerates and re-checks every UNSAT certificate and compares proof hashes;
-  - with `--drat-trim PATH`, also checks every certificate with DRAT-trim.
+  - with `--recheck-certificates`, regenerates and re-checks every UNSAT certificate
+    as extra evidence (a valid regenerated proof with a different hash is a note, not
+    a failure);
+  - with `--drat-trim PATH`, also checks the retained proofs (and any regenerated
+    ones) with DRAT-trim.
 
 ---
 
@@ -201,24 +219,55 @@ A sound checker can never accept a refutation of a satisfiable formula, so the s
 
 ## 6. Exact reproducible commands (for Lumi)
 
+Updated for the two-stage freeze. The positional results path of `audit` comes
+**before** `--splits` (argparse would otherwise read it as a split name; the original
+version of this section had that ordering defect).
+
 ```bash
 cd lab
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt -c constraints-om-c001-r2.txt && pip install -e .
-pytest -q                                   # 134 passed, 2 skipped (DRAT-trim tests skip without the binary)
+pytest -q                     # DRAT-trim tests skip without OM_DRAT_TRIM
 OUT=results/om_c001_r2
 python -m om_lab.width_experiment seeds --out $OUT/seeds.json
 python -m om_lab.width_experiment validate-certifier --out $OUT/certifier_validation.json   # add --drat-trim /path/to/drat-trim
 python -m om_lab.width_experiment smoke --out-dir $OUT/smoke
-python -m om_lab.width_experiment run --split train --out-dir $OUT --workers 4
-sha256sum $OUT/confirmatory_train_results.jsonl   # expect 0e193993bddc89a09005c5e04d04710189162a59362745a9206d0ce635e08339
-python -m om_lab.width_experiment audit $OUT/confirmatory_train_results.jsonl --splits train --recompute-features --recheck-certificates
-python -m om_lab.width_experiment freeze --out $OUT/freeze.json    # DRAFT; Lumi authorises after approval
 
-# Only after Lumi sets confirmatory_authorized=true / authorized_by in freeze.json:
-python -m om_lab.width_experiment run --split test --freeze $OUT/freeze.json --out-dir $OUT --workers 4
-python -m om_lab.width_experiment combine --out $OUT/results.jsonl $OUT/confirmatory_train_results.jsonl $OUT/confirmatory_test_results.jsonl
-python -m om_lab.width_experiment audit $OUT/results.jsonl --splits train test --recheck-certificates
+# 1. Training split (complete population; certificates retained)
+python -m om_lab.width_experiment run --split train --out-dir $OUT --workers 4 --keep-certificates
+sha256sum $OUT/confirmatory_train_results.jsonl   # expect 0e193993bddc89a09005c5e04d04710189162a59362745a9206d0ce635e08339
+python -m om_lab.width_experiment audit $OUT/confirmatory_train_results.jsonl --splits train \
+    --certificates-dir $OUT/certificates --certificate-manifest $OUT/confirmatory_train_certificate_manifest.json \
+    --recompute-features
+
+# 2. Stage A (from a clean checkout of the execution commit, in the execution environment)
+python -m om_lab.width_experiment stage-a --out-dir $OUT/freeze \
+    --training-records $OUT/confirmatory_train_results.jsonl \
+    --training-certificates-dir $OUT/certificates \
+    --training-certificate-manifest $OUT/confirmatory_train_certificate_manifest.json \
+    --reproduction-sha256 <SHA-256 of the independently reproduced training file> \
+    --reproduced-by <who reproduced it> --workers 4
+
+# 3. Non-executing preflight (no authorisation needed; runs no solver)
+python -m om_lab.width_experiment preflight --stage-a $OUT/freeze/freeze_stage_a.json --out $OUT/freeze/preflight.json
+
+# 4. Lumi only: Stage B
+python -m om_lab.width_experiment authorize --stage-a $OUT/freeze/freeze_stage_a.json \
+    --authorized-by Lumi --confirm-test-split-unexposed --out $OUT/freeze/freeze_stage_b.json
+
+# 5. The one production run (same --workers/--watchdog-s/--max-attempts as Stage A)
+python -m om_lab.width_experiment run --split test --dry-run --workers 4 --out-dir $OUT \
+    --stage-a $OUT/freeze/freeze_stage_a.json --stage-b $OUT/freeze/freeze_stage_b.json
+python -m om_lab.width_experiment run --split test --workers 4 --keep-certificates --out-dir $OUT \
+    --stage-a $OUT/freeze/freeze_stage_a.json --stage-b $OUT/freeze/freeze_stage_b.json
+
+# 6. Combine and audit
+python -m om_lab.width_experiment combine --out $OUT/results.jsonl \
+    --certificate-manifest $OUT/confirmatory_train_certificate_manifest.json \
+    --certificate-manifest $OUT/confirmatory_test_certificate_manifest.json \
+    $OUT/confirmatory_train_results.jsonl $OUT/confirmatory_test_results.jsonl
+python -m om_lab.width_experiment audit $OUT/results.jsonl --splits train test \
+    --certificates-dir $OUT/certificates --certificate-manifest $OUT/certificate_manifest.json
 python -m om_lab.analyze_width --records $OUT/results.jsonl --population confirmatory --out-dir $OUT/analysis
 ```
 
@@ -243,10 +292,14 @@ enable the cross-check tests: `gcc -O2 -o drat-trim drat-trim.c` and
 | 3 | RUP/RAT redundancy preserves satisfiability. | Established literature (cited); not re-proved here |
 | 4 | `om_lab.proof_check` accepted every genuine certificate and rejected every corrupted or transplanted certificate tested, and agreed with DRAT-trim (5.3; 863/863 training). | Empirical Observation. The checker is **not** claimed correct in general. |
 | 5 | Training-split infrastructure results in 5.1, including byte-identical reruns. | Empirical Observation (one machine) |
-| 6 | The confirmatory guard refuses the test split without a valid, authorised, hash-matching freeze. | Empirical Observation (tested); procedural, not cryptographic |
+| 6 | The confirmatory guard refuses the test split without a valid Stage A and Stage B that match the running code, checkout, environment, artefacts and settings (Section 10). | Empirical Observation (the tested cases in `test_freeze_enforcement.py`); procedural, not cryptographic |
 | 7 | PHP n=3…7 UNSAT claims carry checked certificates. | Empirical Observation |
 | 8 | Odd-charge Tseitin instances validated by `certify_tseitin_by_construction` are UNSAT. | Relies on the parity argument, `DISCOVERY_ROUND_01.md` §5.2: Proved, pending review. Not Lean-Verified by this patch. |
 | 9 | Anything about width predicting DPLL effort. | **No claim.** No predictive statistic was computed. |
+| 10 | Official execution schedules exactly the 840-instance test population; every subset, duplicate, reordering, wrong seed or wrong population tested is refused, dry run or not. | Empirical Observation (tested cases) |
+| 11 | Integrity no longer accepts a status claim without its evidence (Section 10.5). | Empirical Observation (tested forgeries) |
+| 12 | The retained-certificate audit reads the stored `.cnf`/`.drat` bytes, checks their hashes and association, and checks the stored proof against the stored CNF; every tested substitution was rejected (Section 10.6). | Empirical Observation (tested cases). The checker itself is not claimed correct in general (row 4). |
+| 13 | Propagation-count semantics in Section 10.8 describe the frozen source. | Documentation read from the source, pinned by four small tests; not a theorem |
 
 ---
 
@@ -301,3 +354,239 @@ enable the cross-check tests: `gcc -O2 -o drat-trim drat-trim.c` and
 - All timing and determinism observations come from one machine.
 - The stretch goal (a separate width-guided DPLL variant) is deliberately not started.
   Section 7.1 sequences it after the primary runner is frozen.
+
+---
+
+## 10. Phase 4 Gate B/D repair: freeze enforcement, exact scheduling, certificate audit
+
+Author: Claude (lane: freeze enforcement, exact scheduling, certificate auditing,
+production entrypoint). Independent reviewer: Nova. Base: `dev` @ `b6d2b27`.
+Findings: NOVA-R10-01/-02/-03/-05/-15 and Ace's gate review (2026-11-25) sections 3
+and 5; ACE-PLAN-01/02/05/06; ACE-PLAN-04 documentation. Every result in this section
+is **[Claim Level: Empirical Observation]** unless marked otherwise.
+
+### 10.1 Two-stage freeze (`lab/om_lab/freeze.py`, ACE-PLAN-01 / B4)
+
+**Stage A** (`stage-a` command, `freeze_stage_a.json` + `fitted_model.json`). It is
+written only from a checkout whose frozen paths are clean, and only if the training
+artefacts pass the deep check (10.6) and the independent reproduction hash equals the
+training-record hash. Fields:
+
+| Field | Content | Checked at verification |
+|---|---|---|
+| `code` | execution commit (40-hex), frozen paths, `tree_clean: true` | commit exists in the checkout; frozen paths clean now; no frozen path changed between the commit and HEAD |
+| `source_sha256`, `function_sha256` | the 9 runner source files (now including `freeze.py`) and the frozen functions | equal to the running code |
+| `checker` | proof checker name, version, source SHA-256; DRAT-trim path and SHA-256 if used | equal |
+| `environment.python` | implementation, exact version (gates); compiler, build (provenance) | implementation and exact `x.y.z` version equal |
+| `environment.packages` | every installed distribution, PEP 503 name → version | equal as a whole (no change, addition or removal) |
+| `environment.platform` | system, machine (gates); release, platform string (provenance) | system and machine equal |
+| `environment.reference_backend` | python-sat version and the SHA-256 of each compiled extension module it installs (`pysolvers`, which contains the compiled solvers including CaDiCaL, `pyformula`, `pycard`) | equal |
+| `documents` | SHA-256 of `docs/phase3/DISCOVERY_ROUND_01.md` and the amendment documents (default `docs/phase4/ADVERSARIAL_REVIEW_01.md`, `docs/phase4/reviews/REVIEW_PR11_ACE.md`) | equal; ADVERSARIAL_REVIEW_01.md must be listed |
+| `seed_manifest_sha256`, `protocol` | seed manifest hash and protocol constants | equal |
+| `settings` | `workers`, `watchdog_s`, `max_attempts`, `worker_start_timeout_s`, `budget_b`, `max_seconds`, `certify`, `keep_certificates` | valid, and equal in value and type to the run's settings |
+| `population` | schedule summaries (count, cells, per cell, schedule SHA-256) of the train and test populations | equal to the canonical populations |
+| `training` | records path and SHA-256, record count, certificate manifest path and SHA-256, certificates directory, independent reproduction SHA-256 and who reproduced it | files present with those hashes; reproduction hash equal; deep check passes |
+| `model` | `fitted_model.json` path and SHA-256 (M0/M1 and degree-adjusted fits from the training records, via `analyze_width`'s own functions) | file hash equal, and equal to the model recomputed from the training records |
+| `kind`, `experiment`, `freeze_schema_version` (2), `runner_version`, `orchestration_version`, `created_utc` | identity | equal / valid UTC timestamp |
+
+Unknown or missing keys are refused. JSON with duplicate keys or NaN is refused.
+
+**Stage B** (`authorize` command, Lumi only): `stage_a_sha256` (the SHA-256 of the exact
+Stage A bytes), `status: "FROZEN"`, `confirmatory_authorized: true`, `authorized_by`,
+`authorized_at_utc` (UTC, not in the future, not before Stage A), and
+`test_split_unexposed: true`. `authorize` writes Stage B only after a passing preflight
+of that Stage A and an explicit `--confirm-test-split-unexposed`.
+
+**No self-referential commit hash.** Stage A names the execution commit; Stage B names
+Stage A's bytes; neither is inside the commit. Committing Stage B (or anything outside
+the frozen paths) later is allowed: verification checks that the frozen paths are
+unchanged between the execution commit and HEAD.
+
+**Versions.** `RUNNER_VERSION` stays `1.0.0` because the per-instance records are
+unchanged, so the training-record bytes (and the hash an independent reproduction
+checks) are unchanged. The scheduling, verification and output changes carry
+`ORCHESTRATION_VERSION = "1.1.0"`, recorded in Stage A and every run manifest.
+
+### 10.2 Non-executing preflight (Ace, section 3)
+
+`preflight --stage-a` verifies Stage A (including the deep training check) and builds
+the canonical test schedule: 840 instances, 28 cells × 30, indices 70-99, first
+`OM-C001-R2|30|380|70`, last `OM-C001-R2|60|500|99`, and its schedule SHA-256. It needs
+no Stage B, launches no solver and no worker, and reports `solver_launched: false`,
+`authorization_required: false` and the Stage A hash that Stage B must name. This
+removes the circular dependency (authorise → dry run → authorise).
+
+### 10.3 One production entrypoint, exact population (ACE-PLAN-02/06, NOVA-R10-02)
+
+- `run --split test` needs `--stage-a` and `--stage-b`. `run_split` calls
+  `freeze.verify_for_execution`, which re-verifies Stage B and Stage A (10.1) against
+  the live checkout and environment and the requested settings, and returns an
+  `AuthorizedFreeze`.
+- The test split is never a subset: `--indices`, `--n-values`, `--a-values` and
+  `--diagnostic-subset` are refused for it, in dry runs too. A dry run with the freeze
+  records verifies them and reports the authorised schedule; a dry run without them
+  only lists the schedule. Neither runs anything.
+- `run_specs` refuses confirmatory test specs unless it is given an `AuthorizedFreeze`
+  issued by `verify_for_execution` in this process (a hand-built, copied, pickled or
+  `dataclasses.replace`d one is refused), the specs equal the canonical schedule
+  exactly (order, seeds, clause counts, no duplicates, no training index) with the
+  frozen schedule hash, and its settings equal the frozen settings in value and type.
+- `run_instance` refuses a confirmatory test spec unless `run_specs` passed that check.
+- Fault injection is refused for any confirmatory spec in `run_split`, `run_specs`
+  (also when the fault targets a pilot spec in a mixed list) and `run_instance`
+  (NOVA-R10-04).
+
+### 10.4 Partial outputs are marked (NOVA-R10-03)
+
+- A confirmatory training subset needs `--diagnostic-subset`. Its files are named
+  `confirmatory_train_DIAGNOSTIC_SUBSET_*`, and its manifest has
+  `run_mode: "DIAGNOSTIC_SUBSET"`, `complete: false`, `partial: true`, `n_instances`
+  and `n_population` (1960).
+- Every run manifest records `run_mode` (`OFFICIAL`, `DIAGNOSTIC_SUBSET` or `PILOT`),
+  `complete`, `partial`, `n_instances`, `n_population`, `schedule_sha256`, the settings,
+  the authorisation summary and the number of retained certificates.
+- `combine` writes `<out>_combine_manifest.json` (`complete`, `partial`, `n_records`,
+  `n_population` = 2800, input file hashes). A partial confirmatory combine is refused
+  unless the output file name contains `PARTIAL`.
+- Confirmatory runs must use `--keep-certificates`.
+
+### 10.5 Evidence, not status claims (NOVA-R10-05)
+
+The integrity report regenerates each formula from its seed and compares
+`formula_sha256`; re-verifies every SAT model (a complete signed assignment in
+variable order) against the regenerated formula; requires, for every
+`UNSAT_PROOF_CHECKED` claim, a reference UNSAT result with a VALID DRAT certificate
+summary naming this checker (name, version, source SHA-256), a proof hash and
+primary/reference agreement; and rejects `UNSAT_KNOWN_BY_CONSTRUCTION` for random
+3-SAT. Field types are checked strictly (booleans are not integers, NaN is not a
+number, unknown or missing keys fail), so malformed records produce failures instead
+of exceptions (NOVA-R10-06). The summary only says a proof was checked; the stored
+proof itself is checked in 10.6. These are runner-side checks; the analysis's
+`records_to_rows` typing (B5.2) is Nova's and is unchanged here.
+
+### 10.6 Retained-certificate audit (NOVA-R10-15, Gate D2, ACE-PLAN-05)
+
+`audit_retained_certificates` works from the retained files, not from a regenerated
+proof. For every retained pair named in the certificate manifest, and for every
+`UNSAT_PROOF_CHECKED` record (which must have one):
+
+1. the manifest entry names this instance's files (`<sha256(instance_id)[:16]>.cnf/.drat`)
+   and agrees with the record's formula hash and proof hash;
+2. the exact bytes of both files hash to the manifest values (retained proofs are
+   written one stripped line per step, so the file hash equals the record's
+   `proof_sha256`);
+3. the retained CNF parses as canonical DIMACS and equals this instance's regenerated
+   formula;
+4. `om_lab.proof_check` accepts the retained proof against the retained CNF
+   (and DRAT-trim too with `--drat-trim`);
+5. retained files of these instances that the manifest does not name are failures.
+
+Manifests written before this change (no `retained_files`) fall back to the
+conventional file names and the record's hashes, and are counted as legacy entries.
+`--recheck-certificates` regenerates proofs as extra evidence only; it cannot replace
+the retained audit, which a confirmatory audit requires. Different valid proofs are
+allowed: a regenerated proof with another hash is a note, not a failure (NOVA-R10-07).
+Stage A's deep check runs this audit on the training certificates.
+
+### 10.7 Ace's section 5 attacks (all rejected)
+
+Synthetic, training and pilot data, and non-executing schedules only.
+Tests are in `lab/tests/test_freeze_enforcement.py` unless noted.
+
+| Attack | Rejected by | Tests |
+|---|---|---|
+| Substitute a retained `.drat` file | byte hash vs manifest; manifest vs record; stored proof checked against stored CNF; Stage A deep check | `test_attack_substituted_training_drat_rejected_at_execution`, `test_d2_*` |
+| Forged verification status | evidence checks (10.5) and the retained audit, including after the records hash, Stage A and Stage B are made consistent with the forgery | `test_attack_forged_training_verification_status_rejected[*]`, `test_forged_evidence_fails_integrity[*]` |
+| Alter a frozen training coefficient | model file hash; model recomputed from the training records | `test_attack_altered_frozen_coefficient_rejected`, `..._with_rehashed_stage_a_rejected_by_recomputation` |
+| Authorise a manifest with a dirty source tree | live git check in preflight / `authorize` / execution; `stage-a` refuses too | `test_attack_authorize_with_a_dirty_source_tree_rejected`, `test_attack_dirty_tree_end_to_end_with_real_git`, `test_build_stage_a_refuses[dirty-tree]` |
+| Modify watchdog or retry settings after the freeze | requested vs frozen settings; Stage B hash binding; `run_specs` settings check | `test_settings_changed_after_the_freeze_refused[*]`, `test_official_run_with_changed_settings_refused_before_scheduling[*]`, `test_run_specs_refuses_settings_that_differ_from_the_freeze[*]` |
+| Request one test index in official execution mode | subset refusal in `run_split`; exact-schedule check in `run_specs` | `test_attack_test_split_subset_rejected_even_with_authorisation[*]`, `test_run_specs_refuses_any_other_schedule_even_when_authorised[*]` |
+| Change the Python patch version or a pinned dependency | exact version and whole dependency inventory | `test_environment_drift_after_the_freeze_refused[python-patch, pinned-numpy, pinned-python-sat, ...]` |
+
+ACE-PLAN-01's required regression (every required field tampered or missing) is
+`test_stage_a_missing_field_refused[*]`, `test_stage_a_tampered_field_refused_even_when_re_signed[*]`
+(Stage B is re-signed, so each refusal comes from the field's own check),
+`test_stage_b_missing_field_refused[*]` and `test_stage_b_tampered_field_refused[*]`.
+ACE-PLAN-02's regressions are `test_authorised_full_dry_run_is_accepted_and_runs_nothing`,
+`test_attack_test_split_subset_rejected_even_with_authorisation[one-index-dry-run]`,
+`test_wrong_test_schedules_are_rejected[pilot-population, training-split, ...]`,
+`test_wrong_test_schedules_are_rejected[duplicate-preserving-count]` and
+`test_partial_confirmatory_combine_must_be_named_partial`.
+
+How the tests avoid executing the test split: solver and worker entry points are
+replaced by stubs that fail the test if reached, and the one accepted official run is
+intercepted where `run_specs` would start the first worker. The live environment is a
+deterministic double (`tests/_freeze_fixtures.py`); the real git probe is tested on a
+temporary repository, and one end-to-end test uses real git and real provenance.
+
+### 10.8 Propagation-count semantics of the frozen DPLL (ACE-PLAN-04)
+
+Read from `solvers.solve_dpll` (unchanged since `ed6d557`) and pinned by
+`test_propagation_count_semantics_ace_plan_04` (the vendored `ed6d557` copy gives the
+same counts on those four formulas). **[Documentation of the source, not a theorem.]**
+
+- `decisions` counts branch attempts (each of True, then False), as in 2.2. The
+  primary response depends only on it.
+- `propagations` counts each previously unassigned variable that receives a value
+  from a unit-clause batch. On every recursive entry (after the budget checks) the
+  solver loops: simplify the clause list under the current assignment (drop
+  satisfied clauses and false literals; an empty clause ends the call as a conflict;
+  no clauses left means SAT); collect the batch of unit clauses in clause order;
+  stop if there are none; otherwise assign the batch in order.
+- Within a batch, a unit whose variable is already assigned the same value is not
+  counted; a unit that contradicts an assignment stops the batch at once (the
+  conflicting unit is not counted; units earlier in the batch stay counted; later
+  units are not assigned). Units are not propagated into each other within a batch:
+  clauses that become unit or empty because of the batch are found by the next
+  simplification.
+- The counter is global: propagations in branches that are later refuted, and in a
+  run that exhausts its budget, are included. Branch assignments are decisions, not
+  propagations.
+- The experiment's formulas have three distinct variables per clause, so the Phase 2
+  duplicate-literal issue (9) cannot arise in them.
+
+Per ACE-PLAN-04, an independent tracer need not reproduce this counter unless it copies
+this batch order; a propagation-only discrepancy does not affect the primary estimand.
+
+### 10.9 Limitations and proposed scoped limitations
+
+- **Procedural, not cryptographic (ACE-PLAN-06).** The guard stops accidental
+  unblinding through the supported paths. It does not stop deliberate circumvention
+  inside the process (calling `run_instance(..., official=True)` or the solvers
+  directly, editing the issued-authorisation registry), and Stage B is a JSON file,
+  not a signature: anyone who can write files can write one. The seed scheme is
+  public.
+- **Proposed scoped limitation: no test-split recovery mode.** The test split runs only
+  as the full population. If an instance still fails after `max_attempts`, its ERROR
+  record stays missing data (INCONCLUSIVE under the protocol). A recovery run of
+  named test instances would need authorisation rules that Lumi and Ace have not set,
+  so it is refused rather than guessed at.
+- **Proposed scoped limitation: platform gate.** OS and architecture are gates; the
+  kernel release and platform string are recorded but not gated, because they change
+  on routine updates and the records contain no platform-dependent field except the
+  floats discussed in Section 6. Lumi can ask for them to be gated.
+- **Proposed scoped limitation: legacy certificate manifests.** Manifests without
+  `retained_files` are audited by conventional file names and the record's hashes,
+  and are counted, not refused. The training certificates should be regenerated with
+  this version before Stage A, so this path should not be needed for the freeze.
+- The canonical environment (Ace recommends CPython 3.12.3), the closure ledger and
+  the training-reproduction verification are Lumi's; Stage A records whatever
+  environment it is built in and refuses any later difference.
+- The `freeze` command still writes the schema-1 provenance snapshot, because
+  `analyze_width.reproducibility_gates` reads its `source_sha256` and
+  `environment.packages.numpy`; Stage A carries the same two fields.
+
+### 10.10 Checks run for this repair
+
+All **[Claim Level: Empirical Observation]**, on one Linux x86_64 machine (2 CPUs,
+CPython 3.12.3, python-sat 1.9.dev25, numpy 2.5.5), training data only.
+
+- Full confirmatory training split rerun with this code (`run --split train --workers 2
+  --keep-certificates`, 71 s): 1960/1960 records, SAT 1097, UNSAT 863, integrity and
+  evidence checks passed, `complete: true`, and the results file SHA-256 is again
+  `0e193993bddc89a09005c5e04d04710189162a59362745a9206d0ce635e08339`, so the record
+  bytes are unchanged by this repair.
+- Retained-certificate audit of that run (`audit ... --certificates-dir
+  --certificate-manifest --drat-trim`): 0 failures; 863/863 retained proofs accepted by
+  `om_lab.proof_check` against their retained CNFs and 863/863 VERIFIED by DRAT-trim.
+- `stage-a` from a checkout with uncommitted changes under `lab/om_lab` is refused.
