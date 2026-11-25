@@ -172,6 +172,8 @@ def test_disconnected_even_total_charge_can_be_component_odd_and_unsat():
     with pytest.raises(ValueError, match="not connected"):
         validate_graph(graph, require_connected=True, require_cubic=True)
 
+    # Each K4 component has odd charge.  Total charge is even, but the formula
+    # is still UNSAT because parity must hold separately in every component.
     charges = (1, 0, 0, 0, 1, 0, 0, 0)
     instance = encode_tseitin(graph, charges)
 
