@@ -673,6 +673,38 @@ def test_DEE_R9_17_bootstrap_is_equal_cell_weighted():
     assert result["mean"] == pytest.approx(2 / 3)
 
 
+def test_DEE_R9_17_point_mae_is_equal_cell_weighted():
+    """DEE-G26-04: evaluate()'s point MAEs are equal-cell-weighted
+    on unequal-size test cells, matching the bootstrap. Cell A has
+    1 test row, cell B has 3; the equal-cell-weighted improvement is
+    0.875, the row-weighted one would be 0.833. (The bootstrap half
+    of G26-04 is already covered by
+    test_DEE_R9_17_bootstrap_is_equal_cell_weighted, whose fixture
+    cells have 2 and 4 rows.)"""
+    train = [
+        _row(30, 120, "train", 10, 5.0, 1.0, index=0),
+        _row(30, 120, "train", 12, 5.0, 2.0, index=1),
+        _row(30, 120, "train", 14, 5.0, 3.0, index=2),
+        _row(40, 160, "train", 20, 5.0, 4.0, index=0),
+        _row(40, 160, "train", 22, 5.0, 5.0, index=1),
+    ]
+    fit = fit_m0_m1(train)
+    assert fit["beta"] == pytest.approx(0.5)
+    test = [
+        _row(30, 120, "test", 13, 5.0, 2.5, index=70),
+        _row(40, 160, "test", 23, 5.0, 6.0, index=70),
+        _row(40, 160, "test", 20, 5.0, 4.0, index=71),
+        _row(40, 160, "test", 22, 5.0, 5.0, index=72),
+    ]
+    ev = evaluate(test, fit, fit_degree_adjusted(train))
+    # Cell A: MAE0 0.5, MAE1 0. Cell B: MAE0 2.5/3, MAE1 0.5/3.
+    # Equal-cell-weighted: MAE0 2/3, MAE1 1/12, improvement 0.875.
+    # Row-weighted would give MAE0 0.75, MAE1 0.125, improvement 0.833.
+    assert ev["mae_m0"] == pytest.approx(2 / 3)
+    assert ev["mae_m1"] == pytest.approx(1 / 12)
+    assert ev["improvement"] == pytest.approx(0.875)
+
+
 def test_DEE_R9_17_bootstrap_samples_exactly_30_per_cell():
     # Section 3.10 fixes the per-cell resample size at 30,
     # regardless of the cell's size -- including cells with fewer
