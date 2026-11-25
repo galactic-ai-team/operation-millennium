@@ -548,3 +548,36 @@ def test_cli_rejects_wrong_identity(tmp_path):
     assert result.returncode != 0
     assert "population identity" in result.stderr
     assert not (tmp_path / "out" / "width_analysis.json").exists()
+
+
+# --- DEE-G26-01: non-finite numeric fields -------------------------------
+
+
+@pytest.mark.parametrize("field,value", [
+    ("degree_mean", float("nan")),
+    ("degree_mean", float("inf")),
+    ("degree_mean", float("-inf")),
+    ("degree_mean", 10**309),          # int too large for finite float
+    ("y", float("nan")),
+    ("y", float("inf")),
+    ("max_seconds", float("nan")),
+])
+def test_non_finite_numeric_fields_rejected(field, value):
+    """DEE-G26-01: NaN / inf / int-overflow in a numeric field is
+    rejected by the strict validator, so it cannot contaminate the
+    M2/M3 output or produce invalid JSON."""
+    record = _make_record(30, 400, 0)
+    record[field] = value
+    with pytest.raises(ValueError, match=field):
+        validate_record_types(record)
+
+
+def test_non_finite_degree_mean_does_not_reach_analysis_output():
+    """DEE-G26-01 end-to-end: an otherwise-complete dataset with one
+    NaN in ``degree_mean`` is rejected by ``analyze_records`` at the
+    type-validation step, so ``width_analysis.json`` is never
+    written with a NaN token."""
+    records = _complete_records()
+    records[0]["degree_mean"] = float("nan")
+    with pytest.raises(ValueError, match="degree_mean"):
+        _run_official(records)

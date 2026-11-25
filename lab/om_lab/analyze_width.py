@@ -1390,6 +1390,29 @@ def count_error_records(records: list[dict]) -> int:
 RECORD_SCHEMA_VERSION = 1
 
 
+def _require_finite_number(field: str, value, fail) -> None:
+    """Reject NaN / inf and ints too large for a finite float (DEE-G26-01).
+
+    ``type(value)`` is already known to be ``int`` or ``float`` at call
+    sites (bool is rejected earlier).  ``fail`` is the field-name
+    formatter from ``validate_record_types``.
+    """
+    if type(value) is float:
+        if not math.isfinite(value):
+            fail(field, "a finite number (not NaN or inf)", value)
+        return
+    # int path: reject values that overflow to inf when converted to
+    # float, and (defensively) any int whose float conversion is not
+    # finite.  Small ints pass through unchanged.
+    try:
+        converted = float(value)
+    except OverflowError:
+        fail(field, "a number representable as a finite float", value)
+        return
+    if not math.isfinite(converted):
+        fail(field, "a number representable as a finite float", value)
+
+
 def validate_record_types(record: dict) -> None:
     """Strict raw-record validation for the official path (Gate D4).
 
@@ -1451,6 +1474,13 @@ def validate_record_types(record: dict) -> None:
         value = req(field)
         if type(value) not in (int, float):
             fail(field, "a number (not bool or str)", value)
+        # DEE-G26-01: reject NaN / inf and ints that cannot be
+        # represented as a finite float.  ``degree_mean`` is used
+        # downstream by ``fit_degree_adjusted``; a NaN poisons the M2/M3
+        # output, and ``json.dumps`` writes an invalid ``NaN`` token
+        # into ``width_analysis.json``.  ``y`` and ``max_seconds`` are
+        # covered by the same fix for consistency.
+        _require_finite_number(field, value, fail)
         return value
 
     def opt_int(field: str, *, minimum: int | None = None):
@@ -1473,6 +1503,8 @@ def validate_record_types(record: dict) -> None:
         value = req(field)
         if value is not None and type(value) not in (int, float):
             fail(field, "a number or null", value)
+        if value is not None:
+            _require_finite_number(field, value, fail)
         return value
 
     def opt_bool(field: str):
