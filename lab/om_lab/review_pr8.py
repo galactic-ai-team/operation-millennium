@@ -56,6 +56,7 @@ from om_lab.solvers import Status, solve_dpll, solve_pysat, verify_cnf_assignmen
 from om_lab.width_features import primal_min_fill_width
 
 ATTACKED_COMMIT = "c8e61a7"  # PR #8 merge commit; target files unchanged at dev f398de6
+GATE_B_PR24_COMMIT = "98d5208"  # PR #24 final Gate B check (first pass attacked Dee's repair at 03b626d)
 REGISTERED_MOEBIUS_VERTEX_COUNTS = (4, 6, 8, 10, 12, 16, 20, 24, 32)  # DISCOVERY_ROUND_01 s5.4
 REGISTERED_PERMUTATION_SEEDS = tuple(range(100, 120))  # ADVERSARIAL_REVIEW_01 A2
 PERMUTATION_SUITE_BUDGET = 10_000  # project branch budget (OM-C001-R2 B), used for Y_j in A6
@@ -894,7 +895,7 @@ def mutation_probe() -> dict:
         try:
             pair = mi.generate_matched_tseitin_pair(mi.k4())
             dee_pair_assertions = "passed"
-        except AssertionError as exc:  # pragma: no cover - would mean Dee's check caught it
+        except AssertionError as exc:  # since PR #24 (03b626d) Dee's pair assertions catch this mutation
             return {"dee_pair_assertions": f"raised: {exc}", "a3_detects": None}
     finally:
         mi.xor3_clauses = original
@@ -1112,6 +1113,284 @@ def _is_path_decomposition(vertices: Iterable[int], edges: Iterable[tuple[int, i
 
 
 # ---------------------------------------------------------------------------
+# Gate B re-attack of Dee's repair (draft PR #24, 03b626d)
+# ---------------------------------------------------------------------------
+
+
+def validators_accept_legitimate_instances(full: bool = True) -> dict:
+    """Over-rejection check: Dee's validators must accept every legitimate instance.
+
+    ``validate_metadata`` re-encodes since PR #24, so it is applied to every
+    instance the legitimate sweeps build: all charge vectors on the exhaustive
+    graphs under three edge maps, the seed suite under two, both members of
+    every matched pair on the connected exhaustive graphs, vertex-permuted
+    pairs, and the empty graph.
+    """
+    rejected: list[tuple] = []
+    counts = Counter()
+
+    def check(kind: str, label: tuple, inst: mi.TseitinInstance) -> None:
+        counts[kind] += 1
+        try:
+            mi.validate_graph(inst.graph, require_connected=False, require_cubic=True)
+            mi.validate_metadata(inst)
+        except (ValueError, TypeError, AssertionError) as exc:
+            rejected.append((kind,) + label + (f"{type(exc).__name__}: {exc}",))
+
+    graphs = exhaustive_graphs() if full else [g_k4(), g_k33(), g_prism(3), g_union(g_k4(), g_k4())]
+    for g in graphs:
+        dee = g.to_dee()
+        variants = edge_id_variants(g) if full else {"default": edge_id_variants(g)["default"],
+                                                     "sparse": edge_id_variants(g)["sparse"]}
+        for ids_name, ids in variants.items():
+            for name, charges in all_charge_vectors(g):
+                check("exhaustive", (g.name, ids_name, name), mi.encode_tseitin(dee, charges, edge_ids=ids))
+    if full:
+        for g in seed_suite_graphs():
+            dee = g.to_dee()
+            for ids_name in ("default", "shuffled"):
+                for name, charges in seed_suite_charge_vectors(g):
+                    check("seed_suite", (g.name, ids_name, name),
+                          mi.encode_tseitin(dee, charges, edge_ids=edge_id_variants(g)[ids_name]))
+    for g in graphs:
+        if len(components_of(g.n, list(g.edges))) != 1:
+            continue
+        dee = g.to_dee()
+        for name, base in all_charge_vectors(g):
+            if sum(base) % 2:
+                continue
+            for flip in range(g.n):
+                pair = mi.generate_matched_tseitin_pair(dee, base_charge=base, flip_vertex=flip)
+                check("pair_member", (g.name, name, flip, "even"), pair.even)
+                check("pair_member", (g.name, name, flip, "odd"), pair.odd)
+    for name, graph in mi.connected_cubic_registry().items():
+        pair = mi.generate_matched_tseitin_pair(graph)
+        n = graph.n_vertices
+        for shift in range(n):
+            for perm in (mi.rotation_permutation(n, shift), tuple(reversed(mi.rotation_permutation(n, shift)))):
+                permuted = mi.permute_matched_pair(pair, perm)
+                check("permuted_pair_member", (name, shift, "even"), permuted.even)
+                check("permuted_pair_member", (name, shift, "odd"), permuted.odd)
+    check("empty_graph", ("empty",), mi.encode_tseitin(mi.SimpleGraph(0, ()), ()))
+    return {"checked": dict(sorted(counts.items())), "total": sum(counts.values()),
+            "rejected": rejected[:20], "n_rejected": len(rejected)}
+
+
+def xor3_signature_preserving_mutations(graph_name: str = "petersen") -> dict:
+    """Two deliberate bugs in ``xor3_clauses`` that keep every A3 signature.
+
+    ``sign_swap`` exchanges the third literals of the 2nd and 4th rhs=1 clauses
+    (one positive, one negative): same variables, same per-variable sign counts,
+    but the clause group no longer encodes XOR = 1. ``parity_flip`` encodes
+    XOR = 1 - rhs everywhere. Reports whether ``generate_matched_tseitin_pair``
+    raises, and each member's declared label against PySAT on its clauses.
+    """
+    original = mi.xor3_clauses
+
+    def sign_swap(a: int, b: int, c: int, rhs: int):
+        cls = [list(x) for x in original(a, b, c, rhs)]
+        if rhs == 1:
+            cls[1][2], cls[3][2] = cls[3][2], cls[1][2]
+        return tuple(tuple(x) for x in cls)
+
+    def parity_flip(a: int, b: int, c: int, rhs: int):
+        return original(a, b, c, 1 - rhs)
+
+    graph = {"petersen": mi.petersen_graph, "k4": mi.k4}[graph_name]()
+    rows = {}
+    for name, fn in (("sign_swap", sign_swap), ("parity_flip", parity_flip)):
+        mi.xor3_clauses = fn
+        try:
+            try:
+                pair = mi.generate_matched_tseitin_pair(graph)
+                raised = None
+            except AssertionError as exc:
+                pair, raised = None, str(exc)
+        finally:
+            mi.xor3_clauses = original
+        row: dict = {"generator_raised": raised}
+        if pair is not None:
+            report = a3_report(pair.even.n_vars, pair.even.clauses, pair.odd.n_vars, pair.odd.clauses)
+            row["a3_all_equal"] = all(report.values())
+            for role, inst in (("even", pair.even), ("odd", pair.odd)):
+                row[role] = {
+                    "declared_label": _sat_label(mi.is_parity_satisfiable(inst)),
+                    "cnf_status": _sat_label(solve_pysat(inst.n_vars, [list(c) for c in inst.clauses]).satisfiable),
+                    "decodes_to_exact_xor": decode_xor_cnf(inst.clauses).exact,
+                }
+        rows[name] = row
+    return rows
+
+
+def integrity_fuzz(trials: int = 6000, seed: str = "OM-P4-PR24|fuzz") -> dict:
+    """Random single mutations of valid instances against validate_graph + validate_metadata.
+
+    Each trial encodes a random charge vector on a random exhaustive graph with
+    random distinct sparse ids, applies one mutation (kinds below), and records
+    whether the validators accept it. An accepted mutant is "non-canonical" when
+    it differs from ``encode_tseitin(graph, charges, edge_ids)`` or carries a
+    non-int ``n_vars`` or charge.
+    """
+    rng = random.Random(seed)
+    graphs = [g.to_dee() for g in exhaustive_graphs()]
+    kinds = ["flip_sign", "drop_clause", "dup_clause", "swap_clauses", "change_var", "change_charge", "swap_ids",
+             "shift_id", "dup_id", "n_vars_plus", "n_vars_float", "charges_float", "repoint_edge", "reorder_edges",
+             "metadata_extra"]
+    stats = {k: {"tried": 0, "accepted": 0, "accepted_noncanonical": 0, "escaped_non_valueerror": 0} for k in kinds}
+    for _ in range(trials):
+        g = rng.choice(graphs)
+        base = mi.encode_tseitin(g, tuple(rng.randint(0, 1) for _ in range(g.n_vertices)),
+                                 edge_ids=tuple(rng.sample(range(1, 4 * len(g.edges)), len(g.edges))))
+        kind = rng.choice(kinds)
+        cl = [list(c) for c in base.clauses]
+        kw: dict = {}
+        md = dict(base.metadata)
+        if kind == "flip_sign":
+            i, j = rng.randrange(len(cl)), rng.randrange(3)
+            cl[i][j] = -cl[i][j]
+        elif kind == "drop_clause":
+            cl.pop(rng.randrange(len(cl)))
+            md["n_clauses"] = len(cl)
+        elif kind == "dup_clause":
+            cl.append(list(rng.choice(cl)))
+            md["n_clauses"] = len(cl)
+        elif kind == "swap_clauses":
+            i, j = rng.sample(range(len(cl)), 2)
+            cl[i], cl[j] = cl[j], cl[i]
+        elif kind == "change_var":
+            i, j = rng.randrange(len(cl)), rng.randrange(3)
+            v = rng.choice(base.edge_ids)
+            cl[i][j] = v if cl[i][j] > 0 else -v
+        elif kind == "change_charge":
+            ch = list(base.charges)
+            k = rng.randrange(len(ch))
+            ch[k] ^= 1
+            kw["charges"] = tuple(ch)
+            md["charge_sum_mod2"] = sum(ch) % 2
+            md["component_charge_parities"] = mi.component_charge_parities(base.graph, ch)
+        elif kind == "swap_ids":
+            ids = list(base.edge_ids)
+            i, j = rng.sample(range(len(ids)), 2)
+            ids[i], ids[j] = ids[j], ids[i]
+            kw["edge_ids"] = tuple(ids)
+        elif kind == "shift_id":
+            ids = list(base.edge_ids)
+            i = rng.randrange(len(ids))
+            free = sorted(set(range(1, max(ids))) - set(ids))
+            if free:
+                ids[i] = rng.choice(free)
+            kw["edge_ids"] = tuple(ids)
+        elif kind == "dup_id":
+            ids = list(base.edge_ids)
+            i, j = rng.sample(range(len(ids)), 2)
+            ids[j] = ids[i]
+            kw["edge_ids"] = tuple(ids)
+        elif kind == "n_vars_plus":
+            kw["n_vars"] = base.n_vars + 1
+            md["n_vars"] = base.n_vars + 1
+        elif kind == "n_vars_float":
+            kw["n_vars"] = float(base.n_vars)
+        elif kind == "charges_float":
+            kw["charges"] = tuple(float(c) for c in base.charges)
+        elif kind == "repoint_edge":
+            edges = list(base.graph.edges)
+            i = rng.randrange(len(edges))
+            u, _v = edges[i]
+            edges[i] = (u, rng.randrange(base.graph.n_vertices + 2))
+            kw["graph"] = mi.SimpleGraph(base.graph.n_vertices, tuple(edges))
+        elif kind == "reorder_edges":
+            edges = list(base.graph.edges)
+            rng.shuffle(edges)
+            kw["graph"] = mi.SimpleGraph(base.graph.n_vertices, tuple(edges))
+        elif kind == "metadata_extra":
+            md["note"] = "extra"
+        inst = replace(base, clauses=tuple(tuple(c) for c in cl), metadata=md, **kw)
+        st = stats[kind]
+        st["tried"] += 1
+        try:
+            mi.validate_graph(inst.graph, require_connected=False, require_cubic=True)
+            mi.validate_metadata(inst)
+        except ValueError:
+            continue
+        except Exception:  # noqa: BLE001 - counted: the documented exception type is ValueError
+            st["escaped_non_valueerror"] += 1
+            continue
+        st["accepted"] += 1
+        try:
+            canon = mi.encode_tseitin(inst.graph, inst.charges, edge_ids=inst.edge_ids)
+            same = (canon.clauses == inst.clauses and canon.n_vars == inst.n_vars and type(inst.n_vars) is int
+                    and tuple(inst.charges) == canon.charges and all(type(c) is int for c in inst.charges))
+        except (ValueError, TypeError):
+            same = False
+        if not same:
+            st["accepted_noncanonical"] += 1
+    return {"seed": seed, "trials": trials, "by_kind": stats,
+            "accepted_noncanonical_kinds": sorted(k for k, v in stats.items() if v["accepted_noncanonical"])}
+
+
+def declared_var_cost(tops: Sequence[int] = (10_000, 30_000)) -> dict:
+    """Seconds for primal_graph and min_fill_width_estimate on K4 when one edge id is ``top``.
+
+    Not part of run_all (about 5 minutes at 30,000 on the review machine).
+    """
+    import time
+
+    rows = {}
+    for top in tops:
+        inst = mi.encode_tseitin(mi.k4(), (0, 0, 0, 0), edge_ids=(1, 2, 3, 4, 5, top))
+        t0 = time.perf_counter()
+        mi.primal_graph(inst)
+        t1 = time.perf_counter()
+        width = mi.min_fill_width_estimate(inst)
+        t2 = time.perf_counter()
+        rows[str(top)] = {"primal_graph_s": round(t1 - t0, 3), "min_fill_s": round(t2 - t1, 2), "width": width}
+    return rows
+
+
+def pr24_type_probes() -> dict:
+    """Type-only malformations found at Gate B (CLAUDE-G24-01, G24-04).
+
+    ``n_vars_float`` is a hand-built copy of a valid odd K4 instance with
+    ``n_vars=6.0``; ``charges_float`` and ``charges_bool`` are built with
+    ``encode_tseitin``. For each: does ``validate_metadata`` accept it, and what
+    do the direct consumers do with it? At 03b626d all three were accepted;
+    since Dee's 577e469 ``validate_metadata`` rejects ``n_vars_float`` and
+    ``encode_tseitin`` refuses the non-int charges (TypeError).
+    """
+    from om_lab.certify import certify_tseitin_by_construction
+
+    odd = mi.encode_tseitin(mi.k4(), (1, 0, 0, 0))
+    builders = {
+        "n_vars_float": lambda: replace(odd, n_vars=float(odd.n_vars)),
+        "charges_float": lambda: mi.encode_tseitin(mi.k4(), (1.0, 0.0, 0.0, 0.0)),
+        "charges_bool": lambda: mi.encode_tseitin(mi.k4(), (True, False, False, False)),
+    }
+    rows = {}
+    for name, build in builders.items():
+        row: dict = {}
+        try:
+            inst = build()
+        except (ValueError, TypeError) as exc:
+            rows[name] = {"construction": f"{type(exc).__name__}: {exc}"}
+            continue
+        for label, fn in (
+            ("validate_metadata", lambda: mi.validate_metadata(inst)),
+            ("is_parity_satisfiable", lambda: mi.is_parity_satisfiable(inst)),
+            ("solve_pysat", lambda: solve_pysat(inst.n_vars, [list(c) for c in inst.clauses]).status),
+            ("solve_dpll", lambda: solve_dpll(inst.n_vars, [list(c) for c in inst.clauses]).status),
+            ("primal_graph", lambda: len(mi.primal_graph(inst))),
+            ("certify_tseitin_by_construction", lambda: str(certify_tseitin_by_construction(inst)["verification_status"])),
+        ):
+            try:
+                value = fn()
+                row[label] = value if isinstance(value, (bool, int, str)) else str(value)
+            except (ValueError, TypeError) as exc:
+                row[label] = f"raises {type(exc).__name__}"
+        rows[name] = row
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Everything, for the review report
 # ---------------------------------------------------------------------------
 
@@ -1145,6 +1424,13 @@ def run_all(out_dir: str | Path, *, full: bool = True) -> dict:
     summary["log_file"] = log_path.name
     summary["log_sha256"] = hashlib.sha256(data.encode("utf-8")).hexdigest()
     report["permutation_suite"] = summary
+    report["gate_b_pr24"] = {
+        "commit": GATE_B_PR24_COMMIT,
+        "validators_accept_legitimate_instances": validators_accept_legitimate_instances(full=full),
+        "xor3_signature_preserving_mutations": xor3_signature_preserving_mutations(),
+        "type_probes": pr24_type_probes(),
+        "integrity_fuzz": integrity_fuzz(),
+    }
     (out / "review_pr8_report.json").write_text(json.dumps(report, indent=1, sort_keys=True, default=str), encoding="utf-8")
     return report
 
@@ -1173,6 +1459,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"permutation suite: {ps['runs']} runs, status failures={len(ps['status_failures'])}, log sha256={ps['log_sha256']}")
     print("malformed:", Counter(o["classification"] for o in report["malformed"]))
     print(f"min-fill (Dee vs Nova): {report['minfill']['disagreements']}/{report['minfill']['compared']} disagree")
+    gb = report["gate_b_pr24"]["validators_accept_legitimate_instances"]
+    print(f"Gate B (PR #24 at {GATE_B_PR24_COMMIT}): validators rejected {gb['n_rejected']} of {gb['total']} legitimate instances")
     return 0 if not (ex["mismatches"] or ss["mismatches"] or ps["status_failures"]) else 1
 
 

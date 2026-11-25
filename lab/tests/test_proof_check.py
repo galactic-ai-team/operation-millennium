@@ -423,13 +423,33 @@ def test_tseitin_construction_certificate_rejects_tampering():
 def test_tseitin_construction_certificate_rejects_non_integer_identifiers():
     """Cross-impact of CLAUDE-R8-07 (review of PR #8): encode_tseitin accepted
     float and bool edge ids at f398de6, and certify_tseitin_by_construction
-    then labelled such odd instances UNSAT_KNOWN_BY_CONSTRUCTION."""
-    floats = encode_tseitin(k4(), (1, 0, 0, 0), edge_ids=tuple(float(i) for i in range(1, 7)))
-    bools = encode_tseitin(k4(), (1, 0, 0, 0), edge_ids=(True, 2, 3, 4, 5, 6))
-    for instance in (floats, bools):
+    then labelled such odd instances UNSAT_KNOWN_BY_CONSTRUCTION.
+
+    Since Dee's repair (PR #24, 03b626d) encode_tseitin refuses them itself,
+    so the same instances are built by hand here: the certifier must still
+    reject them, and a non-int n_vars (CLAUDE-G24-01) as well."""
+    import dataclasses
+
+    with pytest.raises(TypeError):
+        encode_tseitin(k4(), (1, 0, 0, 0), edge_ids=tuple(float(i) for i in range(1, 7)))
+    with pytest.raises(TypeError):
+        encode_tseitin(k4(), (1, 0, 0, 0), edge_ids=(True, 2, 3, 4, 5, 6))
+    ok = encode_tseitin(k4(), (1, 0, 0, 0))
+    floats = dataclasses.replace(
+        ok,
+        edge_ids=tuple(float(i) for i in ok.edge_ids),
+        n_vars=float(ok.n_vars),
+        clauses=tuple(tuple(float(lit) for lit in clause) for clause in ok.clauses),
+    )
+    bools = dataclasses.replace(  # what encode_tseitin built for edge_ids=(True, 2, ...) before the repair
+        ok,
+        edge_ids=(True,) + ok.edge_ids[1:],
+        clauses=tuple(tuple(True if lit == 1 else lit for lit in clause) for clause in ok.clauses),
+    )
+    float_n_vars = dataclasses.replace(ok, n_vars=float(ok.n_vars))
+    for instance in (floats, bools, float_n_vars):
         result = certify_tseitin_by_construction(instance)
         assert result["verification_status"] == Verification.INVALID, result
-    ok = encode_tseitin(k4(), (1, 0, 0, 0))
     assert certify_tseitin_by_construction(ok)["verification_status"] == Verification.UNSAT_KNOWN_BY_CONSTRUCTION
 
 

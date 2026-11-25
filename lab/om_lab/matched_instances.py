@@ -18,6 +18,46 @@ Claim levels
 This module deliberately includes validators that reject malformed structures.
 The rejection behaviour is a code contract, checked by pytest; it is not a new
 mathematical theorem.
+
+Review repairs (Phase 4, per REVIEW_PR8_CLAUDE.md and REVIEW_PR24_CLAUDE.md)
+---------------------------------------------------------------------------
+- CLAUDE-R8-05 / R8-06: ``validate_encoding`` re-encodes from the declared
+  (graph, charges, edge_ids) and requires clause equality.  Catches
+  missing/extra/substituted clauses, charge/clause disagreements, and
+  edge-map integrity violations (swapped or duplicated ids).
+- CLAUDE-R8-07: ``encode_tseitin`` rejects non-int, bool, and unreasonably-
+  large edge identifiers.
+- CLAUDE-R8-14: ``generate_matched_tseitin_pair`` and ``permute_matched_pair``
+  run A3 clause-level signatures on the pair (clause-length multiset,
+  occurrence profile, primal signature, per-clause variable set).
+- CLAUDE-R8-18: ``min_fill_width_estimate`` delegates to
+  ``width_features.primal_min_fill_width``; ``min_fill_width_with_ordering``
+  exposes the elimination ordering per ruling A1.
+- CLAUDE-R8-09: ``validate_metadata`` checks ``family`` / ``n_vertices`` /
+  ``n_edges``; ``encode_tseitin`` refuses to override computed metadata keys.
+- CLAUDE-G24-01: ``validate_encoding`` rejects ``bool`` / non-``int``
+  ``n_vars`` (type safety before ``primal_graph`` or the solvers raise
+  ``TypeError``).
+- CLAUDE-G24-02: docstrings state the exact coverage of the pair check and
+  its acknowledged limit (a mutation that preserves every checked
+  signature is not caught here).
+- CLAUDE-G24-03: ``MAX_DECLARED_VARS`` bounds allocation, not min-fill time;
+  documented in the constant's comment (the time bound belongs in Nova's
+  frozen file, ruling B4).
+- CLAUDE-G24-04: ``bool`` / non-``int`` charges rejected consistently with
+  the edge-id contract.
+- CLAUDE-G24-05: ``validate_encoding`` converts non-iterable clause
+  ``TypeError`` to ``ValueError``; its docstring names the one remaining
+  ``TypeError`` path (``max`` on an ``edge_ids`` tuple that contains a
+  non-``int`` like ``None``).
+- CLAUDE-G24-06: pair check now includes a per-clause variable-set
+  signature (catches clause reordering).
+- CLAUDE-G24-07: split ``bool`` vs other-type error messages; float
+  message names the type.
+- CLAUDE-G24-08: ``validate_metadata`` converts the ``_check_charges``
+  ``TypeError`` to ``ValueError`` (matches the docstring and
+  ``validate_encoding``); ``encode_tseitin`` keeps ``TypeError`` as the
+  constructor exception.
 """
 
 from __future__ import annotations
@@ -27,6 +67,30 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
 Edge = tuple[int, int]
+
+# Allocation guard against unbounded declared-variable counts downstream.
+#
+# This bounds *allocation cost*: ``primal_graph`` allocates one dict entry
+# per declared variable.  It does NOT bound ``width_features.
+# primal_min_fill_width`` *time*, which grows roughly quadratically in the
+# number of declared-but-unused variables because the elimination loop scans
+# ``remaining`` on each step.  See CLAUDE-G24-03: ~30 s at 10^4 unused
+# declared vars, ~5 min at 3*10^4, extrapolated to days at 10^6.  The time
+# bound belongs in Nova's frozen implementation (ruling B4); callers
+# concerned about it should pass ids close to |E| rather than to this cap.
+MAX_DECLARED_VARS = 1_000_000
+
+# Metadata keys whose values are computed by ``encode_tseitin`` and must
+# not be overridden by a caller (CLAUDE-R8-09 / M18).
+COMPUTED_METADATA_KEYS = frozenset({
+    "family",
+    "n_vertices",
+    "n_edges",
+    "n_vars",
+    "n_clauses",
+    "charge_sum_mod2",
+    "component_charge_parities",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +189,12 @@ def connected_cubic_registry() -> dict[str, SimpleGraph]:
 # ---------------------------------------------------------------------------
 
 def components(graph: SimpleGraph) -> tuple[tuple[int, ...], ...]:
-    """Connected components as sorted vertex tuples."""
+    """Connected components as sorted vertex tuples.
+
+    Silently drops out-of-range edges.  R8-08 remains OPEN: callers who
+    skip ``validate_graph`` can construct a graph whose labels flip.
+    This is the label-functions part of R8-08 and is out of scope here.
+    """
     n = graph.n_vertices
     adj: list[list[int]] = [[] for _ in range(n)]
     for u, v in graph.edges:
@@ -249,14 +318,140 @@ def xor3_clauses(a: int, b: int, c: int, rhs: int) -> tuple[tuple[int, ...], ...
     )
 
 
+# ---------------------------------------------------------------------------
+# A3 clause-level signatures (CLAUDE-R8-14, G24-06)
+# ---------------------------------------------------------------------------
+
+def _clause_length_multiset(
+    clauses: Sequence[Sequence[int]],
+) -> tuple[int, ...]:
+    """Sorted multiset of clause lengths (A3 clause-length signature)."""
+    return tuple(sorted(len(c) for c in clauses))
+
+
+def _occurrence_profile(
+    clauses: Sequence[Sequence[int]],
+    n_vars: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Per-variable positive/negative occurrence counts (A3 occurrence)."""
+    pos = [0] * (n_vars + 1)
+    neg = [0] * (n_vars + 1)
+    for c in clauses:
+        for lit in c:
+            if lit > 0:
+                pos[lit] += 1
+            elif lit < 0:
+                neg[-lit] += 1
+    return (tuple(pos), tuple(neg))
+
+
+def _cnf_primal_signature(instance: TseitinInstance) -> tuple:
+    """Sorted per-vertex neighbourhood list from the CNF primal graph."""
+    adj = primal_graph(instance)
+    return tuple(
+        (v, tuple(sorted(adj[v]))) for v in sorted(adj)
+    )
+
+
+def _per_clause_variable_set(
+    clauses: Sequence[Sequence[int]],
+) -> tuple[tuple[int, ...], ...]:
+    """Positional per-clause variable multiset (A3 clause-var signature).
+
+    Preserves clause position, so this catches clause reordering.  Two
+    matched members generated from the same graph and edge_ids have the
+    same per-clause variable set at every position; a mutation that
+    moves a variable from one clause to another, or reorders clauses,
+    changes this signature.
+    """
+    return tuple(
+        tuple(sorted(abs(lit) for lit in clause))
+        for clause in clauses
+    )
+
+
+def _check_matched_pair_cnf(
+    even: TseitinInstance,
+    odd: TseitinInstance,
+) -> None:
+    """Assert A3 clause-level signatures match between pair members.
+
+    The signatures checked here are:
+
+    - clause-length multiset,
+    - per-variable positive/negative occurrence profile,
+    - primal graph signature,
+    - **positional** per-clause variable set (catches clause
+      reordering; CLAUDE-G24-06).
+
+    Together these catch mutations to ``xor3_clauses`` that change
+    which variables a clause uses, the total signs of any variable,
+    which variables co-occur, or the order of clauses.
+
+    **Acknowledged limit (CLAUDE-G24-02).**  A mutation that preserves
+    every signature above still passes — for example, exchanging the
+    third literals of two clauses that each contain the same three
+    variables but with opposite sign patterns (Claude's ``sign_swap``
+    on Petersen).  Such a mutation changes the encoded parity
+    constraint; the odd member becomes SAT while it is labelled UNSAT
+    by ``is_parity_satisfiable``.  That is a real limitation of the
+    pair check, not a bug; the regression suite catches it via the
+    broader correctness tests in
+    ``tests/test_review_pr8_matched_instances.py`` (R8-01 / R8-20), not
+    via the pair assertion.
+    ``test_r8_14_dee_pair_assertions_now_catch_the_broken_encoder``
+    pins the class of mutations that **is** caught.
+    """
+    if _clause_length_multiset(even.clauses) != _clause_length_multiset(
+        odd.clauses
+    ):
+        raise AssertionError("matched pair clause-length multisets differ")
+    if _occurrence_profile(even.clauses, even.n_vars) != _occurrence_profile(
+        odd.clauses, odd.n_vars
+    ):
+        raise AssertionError("matched pair occurrence profiles differ")
+    if _cnf_primal_signature(even) != _cnf_primal_signature(odd):
+        raise AssertionError("matched pair primal signatures differ")
+    if _per_clause_variable_set(even.clauses) != _per_clause_variable_set(
+        odd.clauses
+    ):
+        raise AssertionError("matched pair per-clause variable sets differ")
+
+
+# ---------------------------------------------------------------------------
+# Encoding and integrity
+# ---------------------------------------------------------------------------
+
+def _check_charges(charges: Sequence[int]) -> None:
+    """Reject ``bool`` and non-``int`` charges; require values 0 or 1.
+
+    ``bool`` is rejected first because ``isinstance(True, int)`` is
+    ``True`` and ``True in (0, 1)`` is also ``True``.
+    CLAUDE-G24-04.
+
+    Raises ``TypeError`` for a wrong type; ``encode_tseitin`` (the
+    constructor) propagates that.  ``validate_metadata`` converts it to
+    ``ValueError`` (CLAUDE-G24-08) so its public contract is
+    ``ValueError`` for everything it rejects.
+    """
+    for c in charges:
+        if isinstance(c, bool):
+            raise TypeError(f"charges must be int, got bool {c!r}")
+        if not isinstance(c, int):
+            raise TypeError(
+                f"charges must be int, got {type(c).__name__} {c!r}"
+            )
+        if c not in (0, 1):
+            raise ValueError(f"charges must be 0 or 1, got {c}")
+
+
 def component_charge_parities(
     graph: SimpleGraph,
     charges: Sequence[int],
 ) -> tuple[tuple[tuple[int, ...], int], ...]:
     if len(charges) != graph.n_vertices:
         raise ValueError("charges length must equal n_vertices")
-    if any(c not in (0, 1) for c in charges):
-        raise ValueError("charges must be 0 or 1")
+    _check_charges(charges)
 
     out: list[tuple[tuple[int, ...], int]] = []
     for comp in components(graph):
@@ -276,6 +471,18 @@ def encode_tseitin(
 
     The graph need not be connected.  Parity satisfiability is checked
     per component by ``parity_obstruction``.
+
+    Edge-identifier contract (CLAUDE-R8-07): ids must be ``int`` (not
+    ``bool``), strictly positive, distinct, and not greater than
+    ``MAX_DECLARED_VARS``.  Sparse ids are allowed.
+
+    Charge contract (CLAUDE-G24-04): charges must be ``int`` (not
+    ``bool``) with values in ``{0, 1}``.  A wrong type raises
+    ``TypeError``; this is a *constructor* and the caller wrote an
+    argument of the wrong type.
+
+    Metadata contract (CLAUDE-R8-09 / M18): keys in
+    ``COMPUTED_METADATA_KEYS`` may not be overridden by the caller.
     """
     if validate:
         validate_graph(graph, require_connected=False, require_cubic=True)
@@ -286,8 +493,7 @@ def encode_tseitin(
     charges = tuple(charges)
     if len(charges) != n:
         raise ValueError("charges length must equal n_vertices")
-    if any(c not in (0, 1) for c in charges):
-        raise ValueError("charges must be 0 or 1")
+    _check_charges(charges)
 
     if edge_ids is None:
         edge_ids = tuple(range(1, m + 1))
@@ -296,10 +502,26 @@ def encode_tseitin(
 
     if len(edge_ids) != m:
         raise ValueError("edge_ids length must equal number of edges")
+    for edge_id in edge_ids:
+        # Reject bool before int: isinstance(True, int) is True.
+        if isinstance(edge_id, bool):
+            raise TypeError(
+                f"edge identifier must be int, got bool {edge_id!r}"
+            )
+        if not isinstance(edge_id, int):
+            raise TypeError(
+                f"edge identifier must be int, "
+                f"got {type(edge_id).__name__} {edge_id!r}"
+            )
+        if edge_id <= 0:
+            raise ValueError("edge identifiers must be positive")
     if len(set(edge_ids)) != m:
         raise ValueError("repeated edge identifiers are not allowed")
-    if any(edge_id <= 0 for edge_id in edge_ids):
-        raise ValueError("edge identifiers must be positive")
+    if edge_ids and max(edge_ids) > MAX_DECLARED_VARS:
+        raise ValueError(
+            f"edge identifier {max(edge_ids)} exceeds "
+            f"MAX_DECLARED_VARS={MAX_DECLARED_VARS}"
+        )
 
     incidence = validate_incidence_multiplicities(graph, require_cubic=True)
 
@@ -328,6 +550,12 @@ def encode_tseitin(
         ),
     }
     if metadata is not None:
+        for key in metadata:
+            if key in COMPUTED_METADATA_KEYS:
+                raise ValueError(
+                    f"metadata key {key!r} is computed by encode_tseitin "
+                    "and cannot be overridden"
+                )
         md.update(metadata)
 
     return TseitinInstance(
@@ -340,13 +568,131 @@ def encode_tseitin(
     )
 
 
+def validate_encoding(instance: TseitinInstance) -> bool:
+    """Verify ``instance.clauses`` equal a fresh encoding of its declared inputs.
+
+    Detects hand-edited instances (CLAUDE-R8-05, R8-06): missing or
+    duplicated clauses, clauses whose sign pattern does not match the
+    declared charges, and clauses whose variable structure does not
+    match the declared edge map.  Also rejects ``bool`` / non-``int``
+    ``n_vars`` (CLAUDE-G24-01) so callers cannot pass a hand-built
+    instance with ``n_vars = 6.0`` to ``primal_graph`` or the solvers
+    and get a ``TypeError`` downstream.
+
+    Raises ``ValueError`` for value mismatches and for structural
+    issues that a hand-built ``TseitinInstance`` could smuggle past the
+    type checks (CLAUDE-G24-05).  Also raises ``ValueError`` when
+    ``encode_tseitin`` raises ``TypeError`` during the re-encode (the
+    exception is caught and re-raised as ``ValueError``).
+
+    The one remaining path that can raise ``TypeError`` is the
+    ``max(instance.edge_ids)`` call below, when ``instance.edge_ids``
+    contains a value that is not comparable to an ``int`` (e.g.
+    ``None``); that path is recorded as Info in CLAUDE-G24-05 and is
+    left as-is, but is named here so callers that catch only
+    ``ValueError`` are aware of it.
+    """
+    # 1. n_vars must be an int (not bool).  Without this, downstream
+    #    code that does ``range(1, n_vars + 1)`` raises TypeError
+    #    (CLAUDE-G24-01).
+    if isinstance(instance.n_vars, bool):
+        raise ValueError("n_vars must be int, got bool")
+    if not isinstance(instance.n_vars, int):
+        raise ValueError(
+            f"n_vars must be int, got {type(instance.n_vars).__name__}"
+        )
+    if instance.n_vars < 0:
+        raise ValueError("n_vars must be non-negative")
+
+    # 2. Clause literals must be ints (not bools) in range ±[1..n_vars].
+    #    Catch non-iterable clauses and re-raise as ValueError so callers
+    #    see one exception type (CLAUDE-G24-05).
+    try:
+        for clause in instance.clauses:
+            for lit in clause:
+                if isinstance(lit, bool) or not isinstance(lit, int):
+                    raise ValueError(
+                        f"clause literal {lit!r} is not an int"
+                    )
+                if lit == 0 or abs(lit) > instance.n_vars:
+                    raise ValueError(
+                        f"clause literal {lit} out of range for "
+                        f"n_vars={instance.n_vars}"
+                    )
+    except TypeError as exc:
+        raise ValueError(
+            f"clause structure is not iterable: {exc}"
+        ) from exc
+
+    # 3. n_vars must equal max(edge_ids), per encode_tseitin.
+    #    (This is the line that can raise TypeError if edge_ids
+    #    contains a non-int; see CLAUDE-G24-05.)
+    expected_n_vars = max(instance.edge_ids) if instance.edge_ids else 0
+    if instance.n_vars != expected_n_vars:
+        raise ValueError(
+            f"n_vars {instance.n_vars} != max(edge_ids) {expected_n_vars}"
+        )
+
+    # 4. Re-encode from the declared inputs and require exact match.
+    try:
+        rebuilt = encode_tseitin(
+            instance.graph,
+            instance.charges,
+            edge_ids=instance.edge_ids,
+            validate=False,
+        )
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            f"instance cannot be re-encoded: {exc}"
+        ) from exc
+    if tuple(tuple(c) for c in rebuilt.clauses) != tuple(
+        tuple(c) for c in instance.clauses
+    ):
+        raise ValueError(
+            "clauses do not match encode_tseitin(graph, charges, edge_ids)"
+        )
+    return True
+
+
 def validate_metadata(
     instance: TseitinInstance,
     metadata: Mapping[str, object] | None = None,
 ) -> bool:
-    """Validate charge metadata against the actual graph and charges."""
+    """Validate charge metadata against the actual graph and charges.
+
+    Checks the structural metadata (``family``, ``n_vertices``,
+    ``n_edges``), the charge metadata, and — as the last step — re-encodes
+    the instance to require clause equality (CLAUDE-R8-05/06).  Also
+    enforces the type contract on ``n_vars`` (via the re-encode) and on
+    ``charges`` (at the top; see CLAUDE-G24-08).
+
+    Raises ``ValueError`` on metadata or clause integrity failures, and
+    on any type problem — including a float or ``bool`` ``charges``
+    entry, whose ``TypeError`` from ``_check_charges`` is converted to
+    ``ValueError`` here so the docstring's promise ("type problems are
+    reported as ``ValueError``") holds.
+    """
+    # Type contract for charges (CLAUDE-G24-08).  ``encode_tseitin`` is
+    # a constructor and keeps ``TypeError`` for the same input; this
+    # function is a validator and its docstring promises ``ValueError``
+    # for everything it rejects.  ``validate_encoding`` also raises
+    # ``ValueError`` for the same hand-built instance.  Convert here.
+    try:
+        _check_charges(instance.charges)
+    except TypeError as exc:
+        raise ValueError(str(exc)) from exc
+
     md = instance.metadata if metadata is None else metadata
 
+    # Structural metadata (CLAUDE-R8-09 / M16).
+    if md.get("family") != "Tseitin":
+        raise ValueError("family metadata mismatch")
+    if md.get("n_vertices") != instance.graph.n_vertices:
+        raise ValueError("n_vertices metadata mismatch")
+    if md.get("n_edges") != len(instance.graph.edges):
+        raise ValueError("n_edges metadata mismatch")
+
+    # Charge metadata.
     expected_sum = sum(instance.charges) % 2
     if md.get("charge_sum_mod2") != expected_sum:
         raise ValueError("charge_sum_mod2 metadata mismatch")
@@ -367,6 +713,11 @@ def validate_metadata(
         raise ValueError("n_vars metadata mismatch")
     if md.get("n_clauses") != len(instance.clauses):
         raise ValueError("n_clauses metadata mismatch")
+
+    # Clause / edge-map / type integrity (CLAUDE-R8-05/06, G24-01).
+    # Runs last so a caller who only cares about metadata mismatches
+    # still sees the specific message above.
+    validate_encoding(instance)
     return True
 
 
@@ -389,7 +740,29 @@ def generate_matched_tseitin_pair(
     base_charge: Sequence[int] | None = None,
     flip_vertex: int = 0,
 ) -> MatchedTseitinPair:
-    """Generate matched even-charge and odd-charge formulas on the same graph."""
+    """Generate matched even-charge and odd-charge formulas on the same graph.
+
+    The pair is encoded from the same graph object with the same default
+    edge ids, so the *graph* signature equality assertions here are
+    tautological.  What is not tautological is ``_check_matched_pair_cnf``:
+    it runs A3 clause-level signatures on the two encoded members
+    (clause-length multiset, occurrence profile, primal signature,
+    per-clause variable set) and raises if any of them differ.
+
+    This catches mutations of ``xor3_clauses`` that change which
+    variables a clause uses, their total signs, their co-occurrence, or
+    their clause position — the class of mutations tested in
+    ``test_r8_14_dee_pair_assertions_now_catch_the_broken_encoder``.
+
+    **Limit (CLAUDE-G24-02).**  A mutation that preserves every checked
+    signature still passes.  The canonical example is Claude's
+    ``sign_swap`` on Petersen: a literal sign inside two same-variable
+    clauses is exchanged, so the occurrence profile, clause-length
+    multiset, primal signature, and per-clause variable set are all
+    unchanged — but the odd member becomes SAT while it is labelled
+    UNSAT.  That mutation is caught by the broader R8-01 / R8-20
+    regression suite, not by this pair assertion.
+    """
     validate_graph(graph, require_connected=True, require_cubic=True)
     n = graph.n_vertices
     if not (0 <= flip_vertex < n):
@@ -402,10 +775,11 @@ def generate_matched_tseitin_pair(
 
     if len(base) != n:
         raise ValueError("base_charge length must equal n_vertices")
-    if any(c not in (0, 1) for c in base):
-        raise ValueError("base_charge entries must be 0 or 1")
+    _check_charges(base)
     if sum(base) % 2 != 0:
-        raise ValueError("base_charge must have even total charge on a connected graph")
+        raise ValueError(
+            "base_charge must have even total charge on a connected graph"
+        )
 
     odd = list(base)
     odd[flip_vertex] ^= 1
@@ -417,6 +791,7 @@ def generate_matched_tseitin_pair(
         raise AssertionError("matched pair graph signatures differ")
     if even_instance.edge_ids != odd_instance.edge_ids:
         raise AssertionError("matched pair edge identifiers differ")
+    _check_matched_pair_cnf(even_instance, odd_instance)
 
     return MatchedTseitinPair(
         graph=graph,
@@ -450,7 +825,17 @@ def validate_tseitin_assignment(
     instance: TseitinInstance,
     assignment: Mapping[int, bool],
 ) -> bool:
-    """Independently check CNF clauses and every vertex parity equation."""
+    """Independently check CNF clauses and every vertex parity equation.
+
+    Callers should first call ``validate_metadata(instance)`` (which
+    now runs ``validate_encoding``).  If the instance's clauses do not
+    match ``encode_tseitin(graph, charges, edge_ids)``, this function
+    checks the model against the *declared* equations, not the stored
+    clauses, and will therefore reject a genuine model of the stored
+    (wrong) clauses.  That is correct behaviour for a malformed
+    instance; the malformed instance should have been rejected earlier
+    by ``validate_metadata``.
+    """
     if not evaluate_cnf(instance, assignment):
         return False
 
@@ -548,6 +933,7 @@ def permute_matched_pair(
 
     new_even = encode_tseitin(new_graph, even_charges)
     new_odd = encode_tseitin(new_graph, odd_charges)
+    _check_matched_pair_cnf(new_even, new_odd)
 
     return MatchedTseitinPair(
         graph=new_graph,
@@ -582,46 +968,28 @@ def primal_graph(instance: TseitinInstance) -> dict[int, set[int]]:
 
 
 def min_fill_width_estimate(instance: TseitinInstance) -> int:
-    """Deterministic min-fill elimination width estimate on the primal graph.
+    """Thin wrapper over ``width_features.primal_min_fill_width``.
 
-    This is **Empirical Observation** as a proxy only.  It is not exact
-    treewidth and is not a proof of any complexity separation.
+    Rulings A1 and B6 (CLAUDE-R8-18): one canonical min-fill
+    implementation.  Returns only the width for historical
+    compatibility; callers that need the elimination ordering (ruling
+    A1) should call ``min_fill_width_with_ordering``.
+
+    Empirical Observation as a proxy only; not exact treewidth.
     """
-    adj = {v: set(neigh) for v, neigh in primal_graph(instance).items()}
-    width = 0
+    from .width_features import primal_min_fill_width
+    return primal_min_fill_width(instance.n_vars, instance.clauses).width
 
-    while adj:
-        best_vertex: int | None = None
-        best_key: tuple[int, int, int] | None = None
 
-        for vertex, neighbours in adj.items():
-            neigh_list = list(neighbours)
-            missing = 0
-            for i in range(len(neigh_list)):
-                for j in range(i + 1, len(neigh_list)):
-                    if neigh_list[j] not in adj[neigh_list[i]]:
-                        missing += 1
-            key = (missing, len(neighbours), vertex)
-            if best_key is None or key < best_key:
-                best_key = key
-                best_vertex = vertex
+def min_fill_width_with_ordering(instance: TseitinInstance):
+    """Canonical min-fill width **and** elimination ordering.
 
-        assert best_vertex is not None
-        neighbours = set(adj[best_vertex])
-        width = max(width, len(neighbours))
-
-        neigh_list = list(neighbours)
-        for i in range(len(neigh_list)):
-            for j in range(i + 1, len(neigh_list)):
-                a, b = neigh_list[i], neigh_list[j]
-                adj[a].add(b)
-                adj[b].add(a)
-
-        for u in neighbours:
-            adj[u].discard(best_vertex)
-        del adj[best_vertex]
-
-    return width
+    Per ruling A1, the elimination ordering must be returned and
+    retained.  Returns a ``width_features.MinFillResult`` with
+    ``.width`` and ``.ordering``.
+    """
+    from .width_features import primal_min_fill_width
+    return primal_min_fill_width(instance.n_vars, instance.clauses)
 
 
 def solver_effort(
@@ -677,6 +1045,8 @@ __all__ = [
     "SimpleGraph",
     "TseitinInstance",
     "MatchedTseitinPair",
+    "MAX_DECLARED_VARS",
+    "COMPUTED_METADATA_KEYS",
     "canonical_edge",
     "normalize_edges",
     "k4",
@@ -692,6 +1062,7 @@ __all__ = [
     "xor3_clauses",
     "component_charge_parities",
     "encode_tseitin",
+    "validate_encoding",
     "validate_metadata",
     "replace_metadata",
     "generate_matched_tseitin_pair",
@@ -710,6 +1081,7 @@ __all__ = [
     "clause_widths",
     "primal_graph",
     "min_fill_width_estimate",
+    "min_fill_width_with_ordering",
     "solver_effort",
     "disconnected_two_k4",
     "duplicate_edge_graph",
