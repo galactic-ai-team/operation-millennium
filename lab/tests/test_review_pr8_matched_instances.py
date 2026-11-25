@@ -12,6 +12,12 @@ Attacked commit: PR #8 merge c8e61a7 (target files byte-identical at dev f398de6
 Everything verified here is [Claim Level: Empirical Observation] on the
 listed graphs, charge vectors and seeds. This file runs a CI-sized subset;
 ``python -m om_lab.review_pr8 --out-dir ...`` runs the full review suite.
+
+Gate B update (docs/phase4/reviews/REVIEW_PR24_CLAUDE.md): Dee's repair in
+draft PR #24 (03b626d) fixes CLAUDE-R8-05/06/07/14/18 and the M16/M18 parts of
+R8-09. The strict xfails for those findings XPASSed there; their markers are
+removed and the tests that pinned the old behaviour now pin the repaired
+behaviour. New Gate B findings are named CLAUDE-G24-NN.
 """
 
 from __future__ import annotations
@@ -86,12 +92,15 @@ def test_seed_suite_vectors_are_documented_and_deterministic():
 # --------------------------------------------------------------------------
 
 EXPECTED_CLASSIFICATION = {
-    "M01": r8.ACCEPTED_INCONSISTENT, "M02": r8.REJECTED_AT_CONSTRUCTION, "M03": r8.REJECTED_AT_CONSTRUCTION,
-    "M04": r8.ACCEPTED_DOWNSTREAM_FAILURE, "M05": r8.ACCEPTED_DOWNSTREAM_FAILURE, "M06": r8.ACCEPTED_CONSISTENT,
-    "M07": r8.REJECTED_AT_CONSTRUCTION, "M08": r8.ACCEPTED_INCONSISTENT, "M09": r8.REJECTED_BY_VALIDATOR,
-    "M10": r8.ACCEPTED_MISLABELED, "M11": r8.ACCEPTED_INCONSISTENT, "M12": r8.REJECTED_BY_VALIDATOR,
+    # Since PR #24 (03b626d): M01, M08, M10, M11, M16, M17 are rejected by
+    # validate_metadata, and M04, M05, M18 are rejected by encode_tseitin.
+    # Before the repair they were ACCEPTED_* (M18: REJECTED_BY_VALIDATOR).
+    "M01": r8.REJECTED_BY_VALIDATOR, "M02": r8.REJECTED_AT_CONSTRUCTION, "M03": r8.REJECTED_AT_CONSTRUCTION,
+    "M04": r8.REJECTED_AT_CONSTRUCTION, "M05": r8.REJECTED_AT_CONSTRUCTION, "M06": r8.ACCEPTED_CONSISTENT,
+    "M07": r8.REJECTED_AT_CONSTRUCTION, "M08": r8.REJECTED_BY_VALIDATOR, "M09": r8.REJECTED_BY_VALIDATOR,
+    "M10": r8.REJECTED_BY_VALIDATOR, "M11": r8.REJECTED_BY_VALIDATOR, "M12": r8.REJECTED_BY_VALIDATOR,
     "M13": r8.REJECTED_BY_VALIDATOR, "M14": r8.REJECTED_BY_VALIDATOR, "M15": r8.REJECTED_BY_VALIDATOR,
-    "M16": r8.ACCEPTED_CONSISTENT, "M17": r8.ACCEPTED_MISLABELED, "M18": r8.REJECTED_BY_VALIDATOR,
+    "M16": r8.REJECTED_BY_VALIDATOR, "M17": r8.REJECTED_BY_VALIDATOR, "M18": r8.REJECTED_AT_CONSTRUCTION,
     "M19": r8.REJECTED_AT_CONSTRUCTION, "M20": r8.REJECTED_AT_CONSTRUCTION, "M21": r8.REJECTED_BY_VALIDATOR,
     "M22": r8.REJECTED_AT_CONSTRUCTION, "M23": r8.REJECTED_AT_CONSTRUCTION, "M24": r8.REJECTED_AT_CONSTRUCTION,
     "M25": r8.REJECTED_AT_CONSTRUCTION, "M26": r8.ACCEPTED_CONSISTENT, "M27": r8.ACCEPTED_CONSISTENT,
@@ -107,6 +116,18 @@ def attack_matrix():
 
 def test_attack_matrix_matches_review_table(attack_matrix):
     assert {k: o.classification for k, o in attack_matrix.items()} == EXPECTED_CLASSIFICATION
+
+
+EXPECTED_REJECTION_REASONS = {  # PR #24: each repaired case is rejected for the right reason
+    "M01": "clauses do not match", "M04": "must be int", "M05": "must be int", "M08": "n_vars",
+    "M10": "clauses do not match", "M11": "clauses do not match", "M16": "family metadata mismatch",
+    "M17": "clauses do not match", "M18": "cannot be overridden",
+}
+
+
+def test_g24_repaired_cases_are_rejected_for_the_right_reason(attack_matrix):
+    for case_id, fragment in EXPECTED_REJECTION_REASONS.items():
+        assert fragment in attack_matrix[case_id].rejected_by, (case_id, attack_matrix[case_id].rejected_by)
 
 
 EXPECTED_A5_LABELS = {"M26": "UNSAT", "M27": "SAT", "M28": "UNSAT", "M29": "SAT", "M30": "SAT"}
@@ -127,29 +148,41 @@ def test_r8_06_swapped_edge_map_makes_dee_reject_a_genuine_model(attack_matrix):
 
 def test_r8_08_components_drop_invalid_edges_and_flip_the_label(attack_matrix):
     notes = attack_matrix["M21"].notes
+    # Still OPEN (Low): components() drops out-of-range edges, and the label
+    # functions do not validate the graph, so the label flips if called anyway.
     assert notes["components_ignores_invalid_edges"] == ((0, 1, 2), (3, 4, 5))
-    assert notes["validate_metadata_alone"] is True
     assert notes["dee_label_if_validate_graph_is_skipped"] == "UNSAT"
     assert notes["cnf_status"] == "SAT"
+    # Repaired by PR #24 as a side effect of validate_encoding: validate_metadata
+    # re-encodes, and the re-encode refuses the invalid endpoints.
+    assert notes["validate_metadata_alone"] is False
 
 
 def test_r8_05_pr10_certifier_rejects_integrity_attacks(attack_matrix):
-    """PR #10's construction certifier re-encodes and compares, so it rejects the
-    integrity attacks that Dee's validators accept, and certifies no accepted
-    malformed case as UNSAT."""
+    """PR #10's construction certifier re-encodes and compares. Since PR #24 Dee's
+    validators reject these cases too; the certifier stays a second line of
+    defence and must still reject them. Only legitimate cases are accepted now."""
+    from om_lab.certify import certify_tseitin_by_construction
+
+    for case_id in ("M01", "M08", "M10", "M11", "M16", "M17"):
+        inst = attack_matrix[case_id].instance
+        assert inst is not None, case_id
+        status = str(certify_tseitin_by_construction(inst)["verification_status"])
+        assert status == "INVALID", (case_id, status)
     statuses = r8.certifier_on_accepted_attacks(list(attack_matrix.values()))
-    for case_id in ("M01", "M08", "M10", "M11", "M17"):
-        assert statuses[case_id] == "INVALID", (case_id, statuses[case_id])
-    malformed = ("M01", "M04", "M05", "M08", "M10", "M11", "M16", "M17")
-    assert all(statuses[c] != "UNSAT_KNOWN_BY_CONSTRUCTION" for c in malformed), statuses
+    assert set(statuses) == {"M06", *EXPECTED_A5_LABELS}
+    assert statuses["M06"] == "NOT_APPLICABLE"
     for case_id, label in EXPECTED_A5_LABELS.items():
         expected = "UNSAT_KNOWN_BY_CONSTRUCTION" if label == "UNSAT" else "NOT_APPLICABLE"
         assert statuses[case_id] == expected, (case_id, statuses[case_id])
 
 
-def test_r8_07_unbounded_edge_ids_declare_unused_variables():
-    inst = mi.encode_tseitin(mi.k4(), (0, 0, 0, 0), edge_ids=(1, 2, 3, 4, 5, 10**7))
-    assert inst.n_vars == 10**7  # primal_graph / min_fill would allocate one entry per declared variable
+def test_r8_07_unbounded_edge_ids_are_capped():
+    """Repaired by PR #24: ids above MAX_DECLARED_VARS (10**6) are refused; the cap itself is allowed."""
+    with pytest.raises(ValueError, match="MAX_DECLARED_VARS"):
+        mi.encode_tseitin(mi.k4(), (0, 0, 0, 0), edge_ids=(1, 2, 3, 4, 5, 10**7))
+    inst = mi.encode_tseitin(mi.k4(), (0, 0, 0, 0), edge_ids=(1, 2, 3, 4, 5, mi.MAX_DECLARED_VARS))
+    assert inst.n_vars == mi.MAX_DECLARED_VARS == 10**6
 
 
 def test_r8_09_metadata_dict_is_mutable_inside_frozen_instance():
@@ -166,12 +199,10 @@ def test_r8_23_solver_effort_verified_is_false_for_unsat():
     assert record["satisfiable"] is False and record["verified"] is False
 
 
-# Desired behaviour for the OPEN malformed-input findings (CLAUDE-R8-05/06/07):
-# Dee's instance-level validators (validate_graph + validate_metadata) should
-# reject these, or the module should classify them explicitly outside its
-# contract. Review section 4 lists both resolution paths.
-@pytest.mark.parametrize("case_id", ["M01", "M04", "M05", "M08", "M10", "M11", "M17"])
-@pytest.mark.xfail(strict=True, reason="CLAUDE-R8-05/06/07 OPEN: accepted malformed instance")
+# CLAUDE-R8-05/06/07 and the M16 part of R8-09, repaired by PR #24 (03b626d):
+# Dee's instance-level validators (validate_graph + validate_metadata) or
+# encode_tseitin now reject every malformed case that was accepted before.
+@pytest.mark.parametrize("case_id", ["M01", "M04", "M05", "M08", "M10", "M11", "M16", "M17"])
 def test_malformed_instances_are_rejected(attack_matrix, case_id):
     assert attack_matrix[case_id].classification in (r8.REJECTED_AT_CONSTRUCTION, r8.REJECTED_BY_VALIDATOR)
 
@@ -188,12 +219,27 @@ def test_r8_13_a3_signatures_equal_on_every_matched_pair():
     assert result["pairs"] == 8 * 4 + 32 * 6 + 32 * 6 + 128 * 8 + 128 * 8
 
 
-def test_r8_14_dee_pair_assertions_miss_a_broken_encoder_that_a3_catches():
+def test_r8_14_dee_pair_assertions_now_catch_the_broken_encoder():
+    """Repaired by PR #24: the generator asserts A3 signatures and catches the review's mutation."""
     probe = r8.mutation_probe()
-    assert probe["dee_pair_assertions"] == "passed"
-    assert probe["a3_detects"] is True
+    assert probe["dee_pair_assertions"] == "raised: matched pair occurrence profiles differ"
     assert mi.xor3_clauses is r8.mi.xor3_clauses  # the probe restored the original encoder
     assert mi.xor3_clauses(1, 2, 3, 1)[0] == (1, 2, 3)
+
+
+def test_g24_02_signature_preserving_xor3_mutations_pass_the_generator():
+    """CLAUDE-G24-02: the limit Dee states. A bug that keeps every A3 signature
+    passes the pair assertions; ``sign_swap`` even makes the odd member SAT while
+    it is labelled UNSAT. The docstrings that say such a mutation "cannot
+    silently pass" overstate the check. This test flips if a semantic self-check
+    of xor3_clauses is added; then update it."""
+    rows = r8.xor3_signature_preserving_mutations()
+    swap, flip = rows["sign_swap"], rows["parity_flip"]
+    assert swap["generator_raised"] is None and swap["a3_all_equal"] is True
+    assert swap["odd"]["declared_label"] == "UNSAT" and swap["odd"]["cnf_status"] == "SAT"
+    assert swap["odd"]["decodes_to_exact_xor"] is False
+    assert flip["generator_raised"] is None and flip["a3_all_equal"] is True
+    assert mi.xor3_clauses is r8.mi.xor3_clauses
 
 
 # --------------------------------------------------------------------------
@@ -279,15 +325,19 @@ def test_r8_18_duplicate_min_fill_agrees_on_registered_tseitin_family():
     assert result["compared"] == 9 * 21 and result["disagreements"] == 0
 
 
-@pytest.mark.xfail(strict=True, reason="CLAUDE-R8-18 OPEN: two production min-fill implementations disagree (A1)")
 def test_r8_18_single_canonical_min_fill():
     inst = generate_random_3sat(11, 23, seed=172)
     assert _dee_width(11, inst.clauses) == primal_min_fill_width(11, inst.clauses).width
 
 
-def test_r8_18_concrete_disagreement_is_reproducible():
-    inst = generate_random_3sat(11, 23, seed=172)
-    assert (_dee_width(11, inst.clauses), primal_min_fill_width(11, inst.clauses).width) == (8, 7)
+def test_r8_18_former_disagreements_now_agree():
+    """Repaired by PR #24: min_fill_width_estimate delegates to the canonical
+    implementation (rulings A1, B6). Before the repair these gave (8, 7) and (7, 6)."""
+    for n, m, seed in ((11, 23, 172), (9, 24, 965)):
+        inst = generate_random_3sat(n, m, seed=seed)
+        assert _dee_width(n, inst.clauses) == primal_min_fill_width(n, inst.clauses).width
+    probe = r8.minfill_random_probe(seeds=range(200))
+    assert probe["compared"] == 200 and probe["disagreements"] == 0
 
 
 # --------------------------------------------------------------------------
@@ -316,3 +366,43 @@ def test_y_definition_used_in_a6_statistics():
     odd = next(r for r in log if r["variant"] == "one" and r["seed"] == 100)
     assert odd["budget_hit"] and odd["dpll_status"] == "UNKNOWN"
     assert odd["y"] == math.log1p(r8.PERMUTATION_SUITE_BUDGET)
+
+
+# --------------------------------------------------------------------------
+# Gate B re-attack of Dee's repair (draft PR #24, 03b626d): CLAUDE-G24-NN
+# --------------------------------------------------------------------------
+
+
+def test_g24_validators_accept_every_legitimate_instance():
+    """No over-rejection: validate_metadata now re-encodes, so every legitimate
+    instance must still pass (CI-sized; the CLI runs the full sweep)."""
+    result = r8.validators_accept_legitimate_instances(full=False)
+    assert result["n_rejected"] == 0, result["rejected"]
+    assert result["total"] == 1761
+
+
+def test_g24_integrity_fuzz_rejects_every_structural_mutation():
+    """6,000 random single mutations (clauses, charges, edge map, n_vars, graph):
+    the validators accept only no-op mutations, extra metadata keys, and the two
+    type-only gaps CLAUDE-G24-01 (float n_vars) and G24-04 (float charges)."""
+    result = r8.integrity_fuzz()
+    assert set(result["accepted_noncanonical_kinds"]) <= {"n_vars_float", "charges_float"}
+    assert all(v["escaped_non_valueerror"] == 0 for v in result["by_kind"].values())
+    assert sum(v["tried"] for v in result["by_kind"].values()) == 6000
+
+
+@pytest.mark.xfail(strict=True, reason="CLAUDE-G24-01 OPEN: validate_metadata accepts a non-int n_vars")
+def test_g24_01_non_integer_n_vars_is_rejected():
+    """A hand-built copy of a valid instance with n_vars=6.0 passes validate_metadata,
+    then solve_pysat, solve_dpll and primal_graph raise TypeError on it."""
+    odd = mi.encode_tseitin(mi.k4(), (1, 0, 0, 0))
+    with pytest.raises(ValueError):
+        mi.validate_metadata(r8.replace(odd, n_vars=6.0))
+
+
+def test_g24_01_consequence_is_a_downstream_type_error_not_a_wrong_label():
+    rows = r8.pr24_type_probes()
+    row = rows["n_vars_float"]
+    assert row["is_parity_satisfiable"] is False  # the label is still right
+    assert row["solve_pysat"] == row["solve_dpll"] == row["primal_graph"] == "raises TypeError"
+    assert row["certify_tseitin_by_construction"] == "INVALID"
