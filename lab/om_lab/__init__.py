@@ -13,8 +13,12 @@ from om_lab.generators import (
     generate_random_3sat,
     generate_tsp,
 )
+from om_lab.proof_check import ProofCheckResult, check_drat
 from om_lab.solvers import (
     SolveResult,
+    Status,
+    StopReason,
+    Verification,
     solve_dpll,
     solve_pysat,
     verify_cnf_assignment,
@@ -30,8 +34,13 @@ __all__ = [
     "CNFFeatures",
     "GraphColoringInstance",
     "MinFillResult",
+    "ProofCheckResult",
     "TSPInstance",
     "SolveResult",
+    "Status",
+    "StopReason",
+    "Verification",
+    "check_drat",
     "extract_features",
     "extract_features_from_clauses",
     "generate_random_3sat",

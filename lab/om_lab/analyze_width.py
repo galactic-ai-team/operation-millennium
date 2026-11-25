@@ -102,6 +102,7 @@ from pathlib import Path
 import platform
 import statistics
 import sys
+import warnings
 
 import matplotlib
 
@@ -1095,6 +1096,11 @@ def analyze_rows(
 # --- Records input (Claude's runner interface) ---------------------------
 
 
+def count_error_records(records: list[dict]) -> int:
+    """Number of runner records with ``status == "ERROR"`` (missing data)."""
+    return sum(1 for rec in records if rec.get("status") == "ERROR")
+
+
 def records_to_rows(records: list[dict]) -> list[dict]:
     """Convert runner JSONL records into analysis rows.
 
@@ -1105,9 +1111,36 @@ def records_to_rows(records: list[dict]) -> list[dict]:
     ``degree_mean`` are absent and the record is a ``random_3sat``
     instance with a seed, the instance is regenerated exactly and the
     features are computed from it (as in ``analyze_hardness``).
+
+    Explicit ``status`` (added with Claude's OM-C001-R2 runner): when a
+    record carries ``status``, it must agree with ``satisfiable`` /
+    ``timed_out`` or a ``ValueError`` is raised. ``status == "ERROR"``
+    marks an infrastructure failure (watchdog / worker crash) that
+    survived reruns; it is missing experimental data (Section 3.6), so it
+    is excluded here rather than read as UNSAT or UNKNOWN. For the
+    confirmatory population the integrity gate then reports the missing
+    row and the primary disposition is INCONCLUSIVE.
     """
     rows: list[dict] = []
+    n_error = count_error_records(records)
+    if n_error:
+        warnings.warn(
+            f"{n_error} ERROR record(s) treated as missing data (rerun them)",
+            stacklevel=2,
+        )
     for rec in records:
+        explicit_status = rec.get("status")
+        if explicit_status is not None:
+            if explicit_status == "ERROR":
+                continue
+            implied = status_from_solver(
+                bool(rec["satisfiable"]), bool(rec.get("timed_out", False))
+            )
+            if explicit_status != implied:
+                raise ValueError(
+                    f"record status {explicit_status!r} contradicts "
+                    f"satisfiable/timed_out (which imply {implied!r})"
+                )
         n = int(rec["n_vars"])
         m = int(rec["n_clauses"])
         width = rec.get("width")
@@ -1442,7 +1475,14 @@ def main() -> None:
     elif args.records:
         if args.population is None:
             parser.error("--population is required with --records")
-        rows = records_to_rows(read_jsonl(args.records))
+        records = read_jsonl(args.records)
+        n_error = count_error_records(records)
+        if n_error:
+            print(
+                f"WARNING: {n_error} ERROR record(s) are missing data and were "
+                "excluded; rerun them with the same instance and budget."
+            )
+        rows = records_to_rows(records)
         population = args.population
     else:
         parser.error("specify --pilot or --records")
