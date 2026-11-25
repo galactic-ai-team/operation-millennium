@@ -23,6 +23,8 @@ import pytest
 from om_lab.analyze_width import (
     analyze_rows,
     confirmatory_seed,
+    fit_fingerprint,
+    fit_m0_m1,
     make_row,
     records_to_rows,
     _reproducibility,
@@ -447,30 +449,45 @@ def _fabricated_confirmatory_rows(seed_fn):
     return rows
 
 
-def _current_repro_manifest():
-    """A reproducibility manifest built from the current environment,
-    so the fabricated population passes the DEE-R9-18 gate. The gate
-    checks the environment, not the population identity -- which is
-    exactly the NOVA-R10-12 finding: the fabricated rows pass it."""
+def _current_repro_manifest(rows=None):
+    """A FROZEN-shaped reproducibility manifest built from the
+    current environment, so the fabricated population passes the
+    DEE-R9-18 gate and the authorization check. The gates check the
+    environment and the authorization fields, not the population
+    identity -- which is exactly the NOVA-R10-12 finding: the
+    fabricated rows pass them. When ``rows`` is given, the
+    fitted-model hash is computed from those rows' training fit."""
     rep = _reproducibility("confirmatory")
-    return {
+    manifest = {
+        "status": "FROZEN",
+        "confirmatory_authorized": True,
         "environment": {"packages": {"numpy": rep["numpy_version"]}},
         "source_sha256": dict(rep["source_file_sha256"]),
     }
+    if rows is not None:
+        train = [r for r in rows if r["split"] == "train"]
+        manifest["fitted_model_sha256"] = fit_fingerprint(fit_m0_m1(train))
+    return manifest
 
 
-def test_fabricated_confirmatory_population_gets_pass():
-    # Finding NOVA-R10-12: the analysis path never checks experiment,
-    # population, seed, formula hash, budget or schema against the
-    # manifest, and never calls the runner audit. A synthetic
-    # population with completely wrong seeds, labelled confirmatory,
-    # gets disposition PASS with integrity passed -- even with a
-    # valid reproducibility manifest, because that gate only checks
-    # the environment.
+def test_fabricated_population_still_passes_legacy_rows_path():
+    # Finding NOVA-R10-12, SCOPE LIMITATION (Gate D repair): the
+    # legacy analyze_rows path operates on pre-built ROWS, not raw
+    # records, so it cannot validate population identity -- a
+    # synthetic population with completely wrong seeds, labelled
+    # confirmatory, still gets disposition PASS here with integrity
+    # passed, even with a valid FROZEN manifest, because no gate in
+    # this path looks at seeds. That is why the OFFICIAL path is
+    # analyze_records (raw records validated against the canonical
+    # seed manifest before conversion) and the CLI uses it; the
+    # same fabricated population is REJECTED there -- see
+    # test_nova_gate_d_attacks.py::test_final_authorization_wrong_identity_refused.
+    # Any future production entrypoint must call analyze_records,
+    # never analyze_rows directly on runner output.
     rows = _fabricated_confirmatory_rows(lambda cell, n, a, i: 10**9 + cell * 1000 + i)
     result = analyze_rows(
         rows, "confirmatory", bootstrap_replicates=200,
-        reproducibility_manifest=_current_repro_manifest(),
+        reproducibility_manifest=_current_repro_manifest(rows),
     )
     assert result["integrity_gates"]["passed"] is True
     assert result["verification_gates"]["passed"] is True
@@ -478,14 +495,14 @@ def test_fabricated_confirmatory_population_gets_pass():
     assert result["primary_disposition"]["disposition"] == "PASS"
     assert result["primary_disposition"]["point_improvement"] > 0.05
     # Control: the identical rows with the true confirmatory seeds get
-    # the identical disposition, proving the analysis never looks at
+    # the identical disposition, proving this path never looks at
     # seeds at all.
     true_rows = _fabricated_confirmatory_rows(
         lambda cell, n, a, i: confirmatory_seed(n, a, i)
     )
     true_result = analyze_rows(
         true_rows, "confirmatory", bootstrap_replicates=200,
-        reproducibility_manifest=_current_repro_manifest(),
+        reproducibility_manifest=_current_repro_manifest(true_rows),
     )
     assert true_result["primary_disposition"] == result["primary_disposition"]
     assert true_result["evaluation"] == result["evaluation"]
