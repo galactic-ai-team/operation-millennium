@@ -98,6 +98,10 @@ theorem sum_vertexParity_eq_zero
 An odd-total-charge parity system has no satisfying
 edge assignment.
 
+Global odd charge is sufficient, not necessary for
+unsatisfiability on disconnected graphs. The full
+componentwise consistency characterization is not proved here.
+
 This theorem concerns finite parity equations, not
 a particular SAT solver or proof system.
 -/
