@@ -817,7 +817,21 @@ def _is_int(value: object) -> bool:
 
 
 def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    """A finite JSON number (int or float, never a bool).
+
+    ``math.isfinite`` on a huge int raises ``OverflowError`` (it converts
+    to float first), so the int path converts defensively: an int too
+    large for a finite float is not a number here (NOVA-G28-01 -- the
+    same guard Dee's ``_require_finite_number`` uses in analyze_width).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float):
+        return math.isfinite(value)
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
 
 
 def _is_sha256(value: object) -> bool:

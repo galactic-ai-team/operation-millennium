@@ -275,6 +275,22 @@ def test_records_schema_and_verification():
     assert report["passed"] and report["verification_gate_ready"]
 
 
+def test_integrity_report_rejects_huge_int_numbers_without_crashing():
+    """NOVA-G28-01: ``_is_number`` must not raise ``OverflowError`` on
+    ints too large for a float. ``math.isfinite(10**309)`` raises (it
+    converts to float first), so a record carrying ``y=10**309`` or
+    ``degree_mean=10**309`` crashed ``integrity_report`` instead of
+    reporting a failure. Huge ints are failures, not crashes."""
+    specs = _pilot_specs(n_values=(30,), a_values=(426,), indices=range(0, 1))
+    out = wx.run_specs(specs, workers=0)
+    for field, value in (("y", 10**309), ("degree_mean", 10**309), ("y", 10**1000)):
+        rec = dict(out.records[0])
+        rec[field] = value
+        report = wx.integrity_report([rec], specs, budget=BUDGET_B)
+        assert not report["passed"]
+        assert any(field in failure for failure in report["failures"])
+
+
 def test_unknown_is_retained_and_never_unsat():
     specs = _pilot_specs(n_values=(60,), a_values=(426,), indices=range(0, 4))
     out = wx.run_specs(specs, budget=5, workers=0)
