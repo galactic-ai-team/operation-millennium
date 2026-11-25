@@ -1,0 +1,17 @@
+name: Lean 4 Verification (Optional)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  lean-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Lean 4 project with Mathlib cache
+        uses: leanprover/lean-action@v1
+        with:
+          project-dir: lean
+          use-mathlib-cache: true

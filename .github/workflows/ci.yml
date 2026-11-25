@@ -1,0 +1,50 @@
+name: Operation Millennium CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  lab-and-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "lab/requirements.txt"
+
+      - name: Install Phase 2 lab dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r lab/requirements.txt
+          pip install -e lab
+
+      - name: Run Phase 2 pytest suite
+        working-directory: lab
+        run: pytest -v
+
+      - name: Smoke-test 3-SAT phase transition script
+        working-directory: lab
+        run: |
+          python -m om_lab.phase_transition --n-vars 20 --trials 5 --out-dir /tmp/ci-phase-results
+          test -s /tmp/ci-phase-results/phase_transition.jsonl
+          test -s /tmp/ci-phase-results/phase_transition.png
+
+      - name: Verify repo structure and Lean zero-sorry hygiene
+        run: |
+          test -f LICENSE
+          test -f README.md
+          test -f docs/ROADMAP.md
+          test -f docs/RULES.md
+          test -f docs/phase1/LITERATURE_MAP.md
+          test -f docs/phase1/BARRIER_CHECKLIST.md
+          test -f lean/lean-toolchain
+          test -f lean/lakefile.toml
+          ! grep -rn "sorry" lean/Millennium/

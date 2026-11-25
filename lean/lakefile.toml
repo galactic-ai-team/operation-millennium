@@ -1,0 +1,11 @@
+name = "operation-millennium"
+version = "0.1.0"
+defaultTargets = ["Millennium"]
+
+[[require]]
+name = "mathlib"
+scope = "leanprover-community"
+rev = "v4.24.0"
+
+[[lean_lib]]
+name = "Millennium"
