@@ -507,7 +507,9 @@ class TestReviewRegressions:
     def test_DEE_R9_04_analyze_rows_filters_error_row(self):
         """Fixed (Nova, Phase 4 PR #9 repair): a row with
         ``status='ERROR'`` and ``y=None`` is excluded as missing data
-        instead of raising TypeError, and counted."""
+        instead of raising TypeError, and counted. Follow-up: the
+        exclusion is also a primary-disposition reason, so any ERROR
+        row forces INCONCLUSIVE."""
         from om_lab.analyze_width import analyze_rows
 
         error_row = _make_row(
@@ -518,6 +520,10 @@ class TestReviewRegressions:
         assert summary["counts"]["n_error_rows"] == 1
         assert summary["counts"]["n_rows"] == 0
         assert summary["primary_disposition"]["disposition"] == "INCONCLUSIVE"
+        assert any(
+            "ERROR row" in r
+            for r in summary["primary_disposition"]["reasons"]
+        )
 
     def test_DEE_R9_04_integrity_gates_reports_none_values(self):
         """Fixed (Nova, Phase 4 PR #9 repair): a None y/decisions/
