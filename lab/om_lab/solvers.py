@@ -20,6 +20,7 @@ class SolveResult:
     decisions: int
     propagations: int
     verified: bool
+    timed_out: bool = False
 
 
 def verify_cnf_assignment(clauses: Sequence[Sequence[int]], model: Sequence[int] | None) -> bool:
@@ -69,12 +70,28 @@ def solve_pysat(
         decisions=decisions,
         propagations=propagations,
         verified=verified,
+        timed_out=False,
     )
 
 
-def solve_dpll(n_vars: int, clauses: Sequence[Sequence[int]]) -> SolveResult:
-    """Pure-Python DPLL baseline with unit propagation and decision/propagation counters."""
+class _DPLLBudgetExceeded(Exception):
+    """Internal signal: decision or wall-clock budget exhausted."""
+
+
+def solve_dpll(
+    n_vars: int,
+    clauses: Sequence[Sequence[int]],
+    max_decisions: int | None = None,
+    max_seconds: float | None = None,
+) -> SolveResult:
+    """Pure-Python DPLL baseline with unit propagation and decision/propagation counters.
+
+    Optional ``max_decisions`` / ``max_seconds`` make the baseline safe for
+    hard-instance benchmarks: if the budget is exhausted, the result carries
+    ``timed_out=True`` and ``verified=False``.
+    """
     t0 = time.perf_counter()
+    deadline = None if max_seconds is None else t0 + max_seconds
     norm_clauses = [list(c) for c in clauses]
     stats = {"decisions": 0, "propagations": 0}
 
@@ -102,6 +119,11 @@ def solve_dpll(n_vars: int, clauses: Sequence[Sequence[int]]) -> SolveResult:
         return new_clauses
 
     def dpll(cls_list: list[list[int]], assign: dict[int, bool]) -> dict[int, bool] | None:
+        if max_decisions is not None and stats["decisions"] >= max_decisions:
+            raise _DPLLBudgetExceeded
+        if deadline is not None and time.perf_counter() > deadline:
+            raise _DPLLBudgetExceeded
+
         # Unit propagation loop
         while True:
             cls_list = simplify(cls_list, assign)
@@ -139,7 +161,21 @@ def solve_dpll(n_vars: int, clauses: Sequence[Sequence[int]]) -> SolveResult:
                 return res
         return None
 
-    solution = dpll(norm_clauses, {})
+    try:
+        solution = dpll(norm_clauses, {})
+    except _DPLLBudgetExceeded:
+        elapsed = time.perf_counter() - t0
+        return SolveResult(
+            solver_name="dpll",
+            satisfiable=False,
+            model=None,
+            elapsed_s=elapsed,
+            decisions=stats["decisions"],
+            propagations=stats["propagations"],
+            verified=False,
+            timed_out=True,
+        )
+
     elapsed = time.perf_counter() - t0
 
     if solution is None:
@@ -151,6 +187,7 @@ def solve_dpll(n_vars: int, clauses: Sequence[Sequence[int]]) -> SolveResult:
             decisions=stats["decisions"],
             propagations=stats["propagations"],
             verified=True,
+            timed_out=False,
         )
 
     model = [v if solution.get(v, True) else -v for v in range(1, n_vars + 1)]
@@ -163,4 +200,5 @@ def solve_dpll(n_vars: int, clauses: Sequence[Sequence[int]]) -> SolveResult:
         decisions=stats["decisions"],
         propagations=stats["propagations"],
         verified=verified,
+        timed_out=False,
     )
