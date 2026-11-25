@@ -7,6 +7,7 @@ from collections import Counter
 
 import pytest
 
+from om_lab import matched_instances as mi
 from om_lab.matched_instances import (
     all_zero_assignment,
     apply_vertex_permutation,
@@ -19,6 +20,7 @@ from om_lab.matched_instances import (
     is_parity_satisfiable,
     k4,
     min_fill_width_estimate,
+    min_fill_width_with_ordering,
     non_cubic_graph,
     parity_obstruction,
     permute_matched_pair,
@@ -27,7 +29,9 @@ from om_lab.matched_instances import (
     rotation_permutation,
     self_loop_graph,
     solver_effort,
+    TseitinInstance,
     validate_all_zero_witness,
+    validate_encoding,
     validate_graph,
     validate_incidence_multiplicities,
     validate_metadata,
@@ -168,8 +172,6 @@ def test_disconnected_even_total_charge_can_be_component_odd_and_unsat():
     with pytest.raises(ValueError, match="not connected"):
         validate_graph(graph, require_connected=True, require_cubic=True)
 
-    # Each K4 component has odd charge.  Total charge is even, but the formula
-    # is still UNSAT because parity must hold separately in every component.
     charges = (1, 0, 0, 0, 1, 0, 0, 0)
     instance = encode_tseitin(graph, charges)
 
@@ -241,3 +243,194 @@ def test_incidence_multiplicities_are_exactly_two_per_edge():
     flat = [idx for vertices in incidence for idx in vertices]
     expected = list(range(len(graph.edges))) * 2
     assert sorted(flat) == sorted(expected)
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE-R8-05/06/07/14/18/09 regression tests (repairs)
+# ---------------------------------------------------------------------------
+
+
+class TestRepairR8_05_06:
+    """validate_encoding rejects instances whose clauses do not match their
+    declared (graph, charges, edge_ids)."""
+
+    def test_valid_instances_pass(self):
+        for name, graph in connected_cubic_registry().items():
+            instance = encode_tseitin(graph, [0] * graph.n_vertices)
+            assert validate_encoding(instance) is True
+            assert validate_metadata(instance) is True
+
+    def test_missing_clause_rejected(self):
+        # CLAUDE-R8-05 / M10: missing clause, n_clauses refreshed.
+        instance = encode_tseitin(k4(), (0, 0, 0, 0))
+        bad = TseitinInstance(
+            graph=instance.graph,
+            charges=instance.charges,
+            edge_ids=instance.edge_ids,
+            n_vars=instance.n_vars,
+            clauses=instance.clauses[1:],
+            metadata={**instance.metadata, "n_clauses": len(instance.clauses) - 1},
+        )
+        with pytest.raises(ValueError, match="clauses do not match"):
+            validate_encoding(bad)
+        with pytest.raises(ValueError):
+            validate_metadata(bad)
+
+    def test_wrong_charges_rejected(self):
+        # CLAUDE-R8-05 / M17: metadata says odd, clauses encode even.
+        instance = encode_tseitin(k4(), (0, 0, 0, 0))
+        bad = TseitinInstance(
+            graph=instance.graph,
+            charges=(1, 0, 0, 0),
+            edge_ids=instance.edge_ids,
+            n_vars=instance.n_vars,
+            clauses=instance.clauses,
+            metadata=instance.metadata,
+        )
+        with pytest.raises(ValueError):
+            validate_encoding(bad)
+
+    def test_swapped_edge_ids_rejected(self):
+        # CLAUDE-R8-06 / M01: edge_ids swapped, clauses unmodified.
+        instance = encode_tseitin(k4(), (0, 0, 0, 0))
+        swapped = (
+            instance.edge_ids[1],
+            instance.edge_ids[0],
+        ) + instance.edge_ids[2:]
+        bad = TseitinInstance(
+            graph=instance.graph,
+            charges=instance.charges,
+            edge_ids=swapped,
+            n_vars=instance.n_vars,
+            clauses=instance.clauses,
+            metadata=instance.metadata,
+        )
+        with pytest.raises(ValueError, match="clauses do not match"):
+            validate_encoding(bad)
+
+    def test_duplicate_ids_hand_built_rejected(self):
+        # CLAUDE-R8-06 / M08: duplicate ids in a hand-built instance.
+        instance = encode_tseitin(k4(), (0, 0, 0, 0))
+        dupe = list(instance.edge_ids)
+        dupe[-1] = dupe[0]
+        bad = TseitinInstance(
+            graph=instance.graph,
+            charges=instance.charges,
+            edge_ids=tuple(dupe),
+            n_vars=instance.n_vars,
+            clauses=instance.clauses,
+            metadata=instance.metadata,
+        )
+        with pytest.raises(ValueError):
+            validate_encoding(bad)
+
+    def test_metadata_override_rejected(self):
+        # CLAUDE-R8-09 / M18: caller cannot override computed keys.
+        with pytest.raises(ValueError, match="computed"):
+            encode_tseitin(k4(), (0, 0, 0, 0), metadata={"charge_sum_mod2": 1})
+        with pytest.raises(ValueError, match="computed"):
+            encode_tseitin(k4(), (0, 0, 0, 0), metadata={"n_vars": 99})
+
+    def test_wrong_structural_metadata_rejected(self):
+        # CLAUDE-R8-09 / M16: wrong n_vertices / n_edges / family.
+        instance = encode_tseitin(k4(), (0, 0, 0, 0))
+        for key, val in (
+            ("n_vertices", 99),
+            ("n_edges", 99),
+            ("family", "SomethingElse"),
+        ):
+            bad = replace_metadata(instance, **{key: val})
+            with pytest.raises(ValueError, match=f"{key}"):
+                validate_metadata(bad)
+
+
+class TestRepairR8_07:
+    """encode_tseitin rejects non-int, bool, and unbounded edge ids."""
+
+    def test_float_ids_rejected(self):
+        # CLAUDE-R8-07 / M04.
+        with pytest.raises((TypeError, ValueError)):
+            encode_tseitin(
+                k4(), (0, 0, 0, 0),
+                edge_ids=(1.0, 2.0, 3.0, 4.0, 5.0, 6.0),
+            )
+
+    def test_bool_ids_rejected(self):
+        # CLAUDE-R8-07 / M05.
+        with pytest.raises((TypeError, ValueError)):
+            encode_tseitin(
+                k4(), (0, 0, 0, 0),
+                edge_ids=(True, 2, 3, 4, 5, 6),
+            )
+
+    def test_unbounded_ids_rejected(self):
+        # CLAUDE-R8-07: unbounded ids are a DoS vector.
+        with pytest.raises(ValueError, match="MAX_DECLARED_VARS"):
+            encode_tseitin(
+                k4(), (0, 0, 0, 0),
+                edge_ids=(1, 2, 3, 4, 5, 10**7),
+            )
+
+    def test_sparse_ids_still_allowed(self):
+        # Sparse positive ids (3i+7) remain legitimate.
+        encode_tseitin(
+            k4(), (0, 0, 0, 0),
+            edge_ids=(7, 10, 13, 16, 19, 22),
+        )
+
+
+class TestRepairR8_14:
+    """generate_matched_tseitin_pair asserts A3 clause-level signatures."""
+
+    def test_broken_xor3_encoder_is_caught(self, monkeypatch):
+        orig = mi.xor3_clauses
+
+        def broken(a: int, b: int, c: int, rhs: int):
+            clauses = orig(a, b, c, rhs)
+            if rhs == 1:
+                # Mutation: replace third literal of clause 1 with the
+                # negation of its second literal (Claude's probe).
+                a2, b2, _c2 = clauses[1]
+                clauses = (clauses[0], (a2, b2, -b2), clauses[2], clauses[3])
+            return clauses
+
+        monkeypatch.setattr(mi, "xor3_clauses", broken)
+        with pytest.raises(AssertionError, match="(occurrence|primal)"):
+            mi.generate_matched_tseitin_pair(k4())
+
+    def test_broken_encoder_also_caught_through_permutation(self, monkeypatch):
+        orig = mi.xor3_clauses
+
+        def broken(a: int, b: int, c: int, rhs: int):
+            clauses = orig(a, b, c, rhs)
+            if rhs == 1:
+                a2, b2, _c2 = clauses[1]
+                clauses = (clauses[0], (a2, b2, -b2), clauses[2], clauses[3])
+            return clauses
+
+        # Build a good pair first (unmutated), then patch and permute.
+        pair = generate_matched_tseitin_pair(k4())
+        monkeypatch.setattr(mi, "xor3_clauses", broken)
+        with pytest.raises(AssertionError):
+            permute_matched_pair(pair, rotation_permutation(4, 1))
+
+
+class TestRepairR8_18:
+    """min_fill_width_estimate delegates to the canonical implementation."""
+
+    def test_width_matches_canonical(self):
+        from om_lab.width_features import primal_min_fill_width
+        for name, graph in connected_cubic_registry().items():
+            instance = encode_tseitin(graph, [0] * graph.n_vertices)
+            expected = primal_min_fill_width(
+                instance.n_vars, instance.clauses
+            ).width
+            assert min_fill_width_estimate(instance) == expected, name
+
+    def test_ordering_exposed(self):
+        from om_lab.width_features import primal_min_fill_width
+        instance = encode_tseitin(k4(), (0, 0, 0, 0))
+        expected = primal_min_fill_width(instance.n_vars, instance.clauses)
+        got = min_fill_width_with_ordering(instance)
+        assert got.width == expected.width
+        assert got.ordering == expected.ordering
