@@ -27,6 +27,7 @@ Observation] (tested, not formally verified).
 
 from __future__ import annotations
 
+import operator
 from typing import Sequence
 
 from om_lab.solvers import SolveResult, Status, Verification, solve_pysat
@@ -110,7 +111,10 @@ def certify_tseitin_by_construction(instance) -> dict:
       component has even charge (no UNSAT claim follows from construction);
     * ``INVALID`` if the instance does not match the construction it claims
       (invalid graph, clauses differing from a fresh encoding, or metadata
-      inconsistent with the charges).
+      inconsistent with the charges), or if it is not a well-formed integer
+      CNF. That last case covers float or bool edge identifiers, which
+      ``encode_tseitin`` accepted at ``f398de6``
+      (``docs/phase4/reviews/REVIEW_PR8_CLAUDE.md`` CLAUDE-R8-07).
     """
     from om_lab.matched_instances import (
         encode_tseitin,
@@ -118,9 +122,18 @@ def certify_tseitin_by_construction(instance) -> dict:
         validate_graph,
         validate_metadata,
     )
+    from om_lab.solvers import normalize_cnf
 
     checks: dict[str, object] = {}
     try:
+        # Integer CNF over 1..n_vars, with integer edge identifiers; raises
+        # TypeError/ValueError for float or bool identifiers and literals.
+        if isinstance(instance.n_vars, bool) or any(isinstance(e, bool) for e in instance.edge_ids):
+            raise ValueError("bool used as an integer identifier")
+        for edge_id in instance.edge_ids:
+            operator.index(edge_id)
+        normalize_cnf(instance.n_vars, instance.clauses)
+        checks["well_formed_integer_cnf"] = True
         validate_graph(instance.graph, require_connected=False, require_cubic=True)
         checks["graph_simple_cubic"] = True
         rebuilt = encode_tseitin(instance.graph, instance.charges, instance.edge_ids)
@@ -129,7 +142,7 @@ def certify_tseitin_by_construction(instance) -> dict:
         )
         checks["n_vars_match"] = rebuilt.n_vars == instance.n_vars
         checks["metadata_valid"] = bool(validate_metadata(instance))
-    except (ValueError, AssertionError) as exc:
+    except (ValueError, TypeError, AssertionError) as exc:
         return {
             "verification_status": Verification.INVALID,
             "justification": None,
