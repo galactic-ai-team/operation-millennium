@@ -66,8 +66,8 @@ def vertexParity
     (x : E → ZMod 2)
     (w : V) : ZMod 2 :=
   ∑ e : E,
-    (if w = u e then x e else 0) +
-    (if w = v e then x e else 0)
+    ((if w = u e then x e else 0) +
+    (if w = v e then x e else 0))
 
 /--
 Every edge contributes its value twice when summing
@@ -178,9 +178,9 @@ theorem vertexParity_eq_triple
   calc
     vertexParity u v x w =
         ∑ e : E,
-          (if e = a w then x e else 0) +
+          ((if e = a w then x e else 0) +
           (if e = b w then x e else 0) +
-          (if e = c w then x e else 0) := by
+          (if e = c w then x e else 0)) := by
       unfold vertexParity
       apply Finset.sum_congr rfl
       intro e _
