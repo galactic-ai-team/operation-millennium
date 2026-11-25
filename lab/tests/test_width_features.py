@@ -521,6 +521,27 @@ def test_non_confirmatory_population_is_inconclusive_by_construction():
     )
 
 
+def test_primary_disposition_error_rows_force_inconclusive():
+    """DEE-R9-04 follow-up: any excluded ERROR row forces
+    INCONCLUSIVE (missing data), even when everything else would
+    PASS. n_error_rows=0 leaves a PASS untouched."""
+    from om_lab.analyze_width import primary_disposition
+
+    base = dict(
+        evaluation={"improvement": 0.5},
+        bootstrap={"ci_lower_2.5": 0.1, "ci_upper_97.5": 0.9, "n_undefined": 0},
+        gates={"passed": True, "failures": []},
+        verification={"passed": True, "failures": []},
+        fit={"beta": 0.5},
+        reproducibility={"evaluated": True, "passed": True, "failures": []},
+    )
+    assert primary_disposition(**base)["disposition"] == "PASS"
+    assert primary_disposition(**base, n_error_rows=0)["disposition"] == "PASS"
+    out = primary_disposition(**base, n_error_rows=1)
+    assert out["disposition"] == "INCONCLUSIVE"
+    assert any("ERROR row" in r for r in out["reasons"])
+
+
 def test_records_to_rows_regenerates_width_and_rejects_bad_records():
     records = [
         {
@@ -641,7 +662,11 @@ def test_DEE_R9_17_bootstrap_is_equal_cell_weighted():
 
 def test_DEE_R9_17_bootstrap_samples_exactly_30_per_cell():
     # Section 3.10 fixes the per-cell resample size at 30,
-    # regardless of the cell's size. Record the size argument of
+    # regardless of the cell's size -- including cells with fewer
+    # than 30 rows (the fixture cells have 2 and 4 rows). The
+    # contract, and why no assert enforces a minimum cell size, is
+    # documented in paired_stratified_bootstrap's docstring
+    # (DEE-R9-17 follow-up). Record the size argument of
     # every rng.integers call the bootstrap makes.
     import numpy as np
     from unittest import mock

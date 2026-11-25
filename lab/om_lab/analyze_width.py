@@ -647,7 +647,19 @@ def paired_stratified_bootstrap(
     Within each test cell, sample exactly BOOTSTRAP_ROWS_PER_CELL
     (30, Section 3.10: fixed size, regardless of the cell's size)
     rows with replacement, resampling the paired (M0, M1) errors
-    together. The replicate improvement is 1 - MAE1 / MAE0 with the
+    together. The fixed draw size applies to every test cell,
+    including non-confirmatory cells with fewer than 30 rows: the 30
+    draws are taken with replacement from whatever rows the cell
+    has. A cell with k < 30 rows is therefore resampled as if it
+    were a 30-row cell, so the interval understates that cell's
+    sampling variability; for non-confirmatory populations the
+    interval is illustrative only (the disposition is INCONCLUSIVE
+    by construction). For the confirmatory population the integrity
+    gates enforce exactly 30 test rows per cell, so the draw size
+    matches the cell size. No assert enforces a minimum cell size,
+    because the pilot legitimately has 5 test rows per cell
+    (DEE-R9-17 follow-up).
+    The replicate improvement is 1 - MAE1 / MAE0 with the
     MAEs equal-cell-weighted (mean of per-cell MAEs), matching
     evaluate() (DEE-R9-17). Fitted models are fixed; only the test
     sample is resampled. Percentiles use linear interpolation
@@ -825,6 +837,7 @@ def primary_disposition(
     fit: dict,
     reproducibility: dict | None = None,
     eval_error: str | None = None,
+    n_error_rows: int = 0,
 ) -> dict:
     """One machine-readable primary disposition (Section 3.10).
 
@@ -836,6 +849,8 @@ def primary_disposition(
     reported separately so the signal is not hidden when verification
     is the blocker. A reproducibility gate that was not evaluated or
     that failed also forces INCONCLUSIVE (Section 3.10, DEE-R9-18).
+    Any excluded ERROR row also forces INCONCLUSIVE: it is missing
+    data, not a measurement (DEE-R9-04 follow-up).
     """
     reasons: list[str] = []
     if not gates["passed"]:
@@ -849,6 +864,11 @@ def primary_disposition(
             )
         elif not reproducibility.get("passed"):
             reasons.extend(reproducibility.get("failures", []))
+    if n_error_rows > 0:
+        reasons.append(
+            f"{n_error_rows} ERROR row(s) excluded as missing data "
+            "(rerun them)"
+        )
     effort_only: str | None = None
     if not gates["passed"]:
         # The effort signal cannot be trusted when the data itself
@@ -1028,7 +1048,9 @@ def analyze_rows(
     still computed and reported so the machinery can be validated.
     No feature is selected, tuned, or changed based on these rows.
     ERROR rows are excluded as missing data, mirroring
-    records_to_rows, and counted (DEE-R9-04).
+    records_to_rows, and counted (DEE-R9-04). Row invariant:
+    ``decisions`` is always a non-negative int; only ERROR rows
+    have None.
     ``reproducibility_manifest`` is the runner's freeze manifest
     JSON, or None to leave the reproducibility gate unevaluated --
     which forces INCONCLUSIVE for the confirmatory population
@@ -1075,6 +1097,7 @@ def analyze_rows(
     disposition = primary_disposition(
         evaluation, bootstrap, gates, verification, fit,
         reproducibility=reproducibility, eval_error=eval_error,
+        n_error_rows=n_error_rows,
     )
     if population != "confirmatory":
         disposition = {
