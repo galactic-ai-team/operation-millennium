@@ -91,7 +91,10 @@ def _make_record(n, a, index, *, seed=None, instance_id=None, status=None,
         "seed_hex": f"{seed:032x}",
         "formula_sha256": _expected_formula_sha256(n, m, seed),
         "width": width,
-        "width_replay": True,
+        # The replayed elimination-order width (an int, equal to width
+        # here); the runner writes replay_elimination_order(...) into
+        # this field, not a boolean (NOVA-G28-02).
+        "width_replay": width,
         "width_ordering_sha256": hashlib.sha256(
             f"order-{n}-{a}-{index}".encode()
         ).hexdigest(),
@@ -581,3 +584,33 @@ def test_non_finite_degree_mean_does_not_reach_analysis_output():
     records[0]["degree_mean"] = float("nan")
     with pytest.raises(ValueError, match="degree_mean"):
         _run_official(records)
+
+
+# --- NOVA-G28-02: the validator must accept genuine runner records --------
+
+
+def test_validate_record_types_accepts_genuine_runner_records(tmp_path):
+    """NOVA-G28-02: ``validate_record_types`` must accept records the
+    runner actually writes. The Gate D validator required ``width_replay``
+    to be a bool, but the runner writes the replayed elimination-order
+    width (an int, equal to ``width``) into that field, so every genuine
+    record was rejected and the official path could not analyse real
+    runner output. This test runs a real 1-instance confirmatory train
+    subset and validates its records, so the fixture cannot drift from
+    the runner's schema again."""
+    from om_lab import width_experiment as wx
+
+    out_dir = tmp_path / "run"
+    wx.run_split(
+        population="confirmatory", split="train", out_dir=out_dir, workers=0,
+        keep_certificates=True, diagnostic_subset=True,
+        n_values=[30], a_values=[426], indices=[0],
+    )
+    result_files = sorted(out_dir.glob("*_results.jsonl"))
+    assert len(result_files) == 1
+    records = wx.read_jsonl(result_files[0])
+    assert len(records) == 1
+    for record in records:
+        validate_record_types(record)
+        assert isinstance(record["width_replay"], int) and not isinstance(record["width_replay"], bool)
+        assert record["width_replay"] == record["width"]
