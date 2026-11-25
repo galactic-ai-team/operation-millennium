@@ -400,7 +400,6 @@ def test_g24_integrity_fuzz_rejects_every_structural_mutation(fuzz):
     assert sum(v["tried"] for v in fuzz["by_kind"].values()) == 6000
 
 
-@pytest.mark.xfail(strict=True, reason="CLAUDE-G24-08 OPEN: validate_metadata raises TypeError, not ValueError, for non-int charges")
 def test_g24_08_validators_reject_only_with_value_error(fuzz):
     """validate_metadata documents ValueError. At 98d5208 every float-charge
     mutant (401 of 401) is rejected with TypeError instead."""
@@ -422,7 +421,6 @@ def test_g24_04_charge_type_contract_of_constructor_and_inner_validator():
             mi.validate_encoding(r8.replace(ok, charges=charges))
 
 
-@pytest.mark.xfail(strict=True, reason="CLAUDE-G24-08 OPEN: validate_metadata raises TypeError, not ValueError, for non-int charges")
 def test_g24_08_validate_metadata_rejects_non_int_charges_with_value_error():
     ok = mi.encode_tseitin(mi.k4(), (1, 0, 0, 0))
     for charges in ((1.0, 0.0, 0.0, 0.0), (True, False, False, False)):
