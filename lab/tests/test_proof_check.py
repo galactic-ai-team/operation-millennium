@@ -420,6 +420,19 @@ def test_tseitin_construction_certificate_rejects_tampering():
     assert certify_tseitin_by_construction(bad_meta)["verification_status"] == Verification.INVALID
 
 
+def test_tseitin_construction_certificate_rejects_non_integer_identifiers():
+    """Cross-impact of CLAUDE-R8-07 (review of PR #8): encode_tseitin accepted
+    float and bool edge ids at f398de6, and certify_tseitin_by_construction
+    then labelled such odd instances UNSAT_KNOWN_BY_CONSTRUCTION."""
+    floats = encode_tseitin(k4(), (1, 0, 0, 0), edge_ids=tuple(float(i) for i in range(1, 7)))
+    bools = encode_tseitin(k4(), (1, 0, 0, 0), edge_ids=(True, 2, 3, 4, 5, 6))
+    for instance in (floats, bools):
+        result = certify_tseitin_by_construction(instance)
+        assert result["verification_status"] == Verification.INVALID, result
+    ok = encode_tseitin(k4(), (1, 0, 0, 0))
+    assert certify_tseitin_by_construction(ok)["verification_status"] == Verification.UNSAT_KNOWN_BY_CONSTRUCTION
+
+
 def test_tseitin_disconnected_uses_per_component_parity():
     graph = disconnected_two_k4()
     one_each = [1, 0, 0, 0, 1, 0, 0, 0]  # even total, odd in both components
