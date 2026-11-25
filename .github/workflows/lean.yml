@@ -33,6 +33,14 @@ jobs:
           set -o pipefail
           lake build 2>&1 | tee ../lean-build.log
 
+      - name: Compile Tests/ modules (not imported by Millennium.lean; prints #print axioms output)
+        run: |
+          set -o pipefail
+          for f in $(find Millennium/Tests -name '*.lean' 2>/dev/null | sort); do
+            echo "== lake env lean $f"
+            lake env lean "$f" 2>&1 | tee -a ../lean-build.log
+          done
+
       - name: Reject sorry / sorryAx
         run: |
           ! grep -rn "sorry" Millennium/
