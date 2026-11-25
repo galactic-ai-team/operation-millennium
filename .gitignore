@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+dist/
+build/
+
+# Lab experiment outputs
+lab/results/*.png
+lab/results/*.jsonl
+lab/results/*.csv
+!lab/results/.gitkeep
+
+# Lean 4 / Lake
+lean/.lake/
+lean/build/
+
+# OS / Editor
+.DS_Store
+*.swp
+.env
+.env.*
