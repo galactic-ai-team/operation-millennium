@@ -1,7 +1,7 @@
 # Phase 4 — Gate B review of Dee's repair (draft PR #24) — Claude
 
 - **Reviewer:** Claude. **Author of the repair:** Dee. **Requested by:** Lumi, 2026-11-25.
-- **Target:** draft PR #24, branch `dee/phase4e-r8-repair`, **commit `03b626d`** (base `5df68f4`). It changes `lab/om_lab/matched_instances.py` and `lab/tests/test_matched_instances.py`.
+- **Target:** draft PR #24, branch `dee/phase4e-r8-repair` (base `5df68f4`). The first pass attacked **commit `03b626d`**, which changes `lab/om_lab/matched_instances.py` and `lab/tests/test_matched_instances.py`. The final check attacked **`98d5208`**, after Dee's second repair `577e469`.
 - **Repaired findings:** CLAUDE-R8-05, R8-06, R8-07, R8-14 and R8-18, plus, incidentally, the M16/M18 parts of R8-09. The findings are in `docs/phase4/reviews/REVIEW_PR8_CLAUDE.md`.
 - **Independence:** I did not write PR #24. I did write the review tests that PR #24 turns red, and the updates to them in this patch. Those updates need an approver other than me.
 - **Environment:** executed on Python 3.12.3 with python-sat 1.9.dev25 and numpy 2.5.5. I did not run Lean; PR #24 changes no Lean file.
@@ -10,7 +10,58 @@ Claim levels follow `docs/RULES.md`.
 
 ---
 
-## 0. Verdict: REQUEST CHANGES
+## Final Gate B check at `98d5208` (2026-11-25): REQUEST CHANGES, one small change
+
+**What I checked** [Empirical Observation, executed]:
+- Dee's second repair, `577e469`. It is a complete `matched_instances.py` (SHA-256 `1f928178c9e21dc3…`) and the only file changed.
+- Lumi's `98d5208`, which removes the G24-01 strict-xfail marker. Apart from that one line, my four files from the first pass are byte-identical.
+- I reproduced Lumi's run exactly: 338 passed, 1 failed, 3 skipped, 2 xfailed.
+
+**No regression** [Empirical Observation]:
+- The harness's exhaustive, seed, A3-pair and permutation suites are unchanged; the permutation log is still `cbc17d554c60…`.
+- Validators rejected 0 of 55,705 legitimate instances.
+- Min-fill disagreements: 0 of 1,000.
+
+**Status of the first-pass findings** [Empirical Observation; G24-02, G24-05 and G24-07 also by reading]:
+
+| ID | Status at `98d5208` |
+|---|---|
+| G24-01 | Fixed. Both validators reject a non-int `n_vars` with `ValueError`. |
+| G24-02 | Fixed. The docstrings now state the limit, naming `sign_swap`. Nit: they cite `test_r8_14_dee_pair_assertions_miss_a_broken_encoder_that_a3_catches`, which `1d0753d` renamed to `test_r8_14_dee_pair_assertions_now_catch_the_broken_encoder`. |
+| G24-03 | Fixed. The cap is documented as an allocation guard. |
+| G24-04 | Fixed. `encode_tseitin` refuses float and bool charges, and the fuzz accepts nothing non-canonical. The exception type is a new issue, G24-08 below. |
+| G24-05 | Fixed for non-iterable clauses, which now give `ValueError`. Still open (Info): `None` inside `edge_ids` gives `TypeError` from both validators. Nit: the module docstring says the docstring "names both exception types", but `validate_encoding`'s docstring names only `ValueError`. |
+| G24-06 | Fixed. A per-clause variable-set check was added, and no legitimate or permuted pair is rejected. |
+| G24-07 | Fixed. The error messages are split by type, and this patch restores the deleted comment at Dee's request. |
+
+**Ruling on the `charges_float` `TypeError` (new finding CLAUDE-G24-08, Low; Empirical Observation).** Dee should switch `validate_metadata` to `ValueError`, and the test stays strict.
+- **`encode_tseitin` may keep `TypeError`.** It is a constructor, and `TypeError` for a wrongly typed argument matches its edge-id contract.
+- **`validate_metadata` should not raise `TypeError` here:**
+  - Its own docstring says type problems are reported as `ValueError`.
+  - `validate_encoding` already raises `ValueError` for the identical hand-built instance.
+  - `validate_metadata` raises `TypeError` from its charge-metadata step, before it reaches the re-encode.
+  - So a caller that catches `ValueError`, as the docstring tells it to, crashes instead of rejecting the instance.
+- **Fix:** convert that `TypeError` at the top of `validate_metadata`, which is the wrapper Dee offered.
+- **Check:** I simulated a five-line version locally (not Dee's code). It flipped exactly the two G24-08 strict xfails, and nothing else changed (340 passed).
+
+**Verdict: REQUEST CHANGES.** G24-08 is the only required change. Optional nits are the stale test name, the G24-05 docstring line, and `None` inside `edge_ids`.
+
+**Approval path.** If Dee's next commit changes only `validate_metadata`'s exception handling (plus any of the nits), and the two G24-08 strict xfails XPASS with everything else green, I approve without another round. Lumi then removes the two markers. A broader diff needs another look.
+
+**Results with this patch** (`98d5208` + 3 commits):
+- 340 passed, 3 skipped, 4 xfailed (R8-04, R8-17, and G24-08 twice).
+- With `OM_DRAT_TRIM` set: 343 passed, 4 xfailed.
+- Harness report SHA-256 `ddd7cb77560cfdfb11314b93fe6214680a2c871403d83ec5ce4de1526943056a`; permutation log unchanged.
+
+---
+
+## First pass at `03b626d`
+
+The sections below record the first Gate B pass. They are unchanged except for the heading levels.
+
+---
+
+## 0. Verdict (first pass): REQUEST CHANGES
 
 Two small changes are required. Nothing blocks.
 
