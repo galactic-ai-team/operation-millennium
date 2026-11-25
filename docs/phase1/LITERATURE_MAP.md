@@ -75,3 +75,29 @@ Any proposed proof of $\mathbf{P} \neq \mathbf{NP}$ (or $\mathbf{P} = \mathbf{NP
 - **David G. M. Mitchell, Bart Selman, and Hector J. Levesque**, *"Hard and Easy Distributions of SAT Problems"*, *Proceedings of the Tenth National Conference on Artificial Intelligence (AAAI-92)*, pp. 459–465, 1992.
   - **Result:** Characterized the sharp satisfiability phase transition for random $k$-SAT (for $3$-SAT, concentrated near clause-to-variable ratio $\alpha = m/n \approx 4.26$), showing that typical hard instances for DPLL-style search cluster around this threshold while under-constrained and heavily over-constrained instances are empirically easier.
   - **Caveat (Honesty Rule):** Average-case or random-instance phase transitions do **not** directly establish worst-case complexity separations, but provide an indispensable controlled laboratory for studying solver behavior and proof-search dynamics.
+
+<!-- Phase 1 audit additions contributed by Gemini (literature lane), appended verbatim from Gemini's Operation Millennium chat, 2026-11-25. -->
+
+---
+
+## Seminal Follow-Ups & Modern Frontiers (Phase 1 Audit Additions)
+
+### 1. Ryan Williams Extensions (Tightening $\mathrm{NEXP}$ to $\mathrm{NQP}$)
+* **Murray & Williams (2018 / 2020) `[Proved]`:** Extended the Easy Witness Lemma from $\mathrm{NEXP}$ down to nondeterministic quasi-polynomial time ($\mathrm{NQP} = \mathrm{NTIME}[n^{\log^{O(1)} n}]$), proving that for every fixed $k$, $\mathrm{NQP}$ does not have $n^{\log^k n}$-size $\mathrm{ACC}^0 \circ \mathrm{THR}$ circuits.
+  * *Citation:* Cody D. Murray and R. Ryan Williams, "Circuit Lower Bounds for Nondeterministic Quasi-Polytime from a New Easy Witness Lemma," *SIAM Journal on Computing*, Vol. 49, Issue 5, pp. STOC18-300–STOC18-322, 2020 (preliminary version: *STOC 2018*, pp. 890–901, DOI: `10.1145/3188745.3188910`). Journal DOI: `10.1137/18M1195887`
+
+### 2. Razborov–Rudich Follow-Ups (Natural Proofs & Learning)
+* **Carmosino, Impagliazzo, Kabanets, & Kolokolova (2016) `[Proved]`:** Proved that any Razborov–Rudich natural proof of a circuit lower bound against a sufficiently powerful circuit class (e.g., containing $\mathrm{AC}^0[p]$) yields a generic randomized learning/compression algorithm for that same circuit class—yielding a quasi-polynomial-time learning algorithm for $\mathrm{AC}^0[p]$.
+  * *Citation:* Marco L. Carmosino, Russell Impagliazzo, Valentine Kabanets, and Antonina Kolokolova, "Learning Algorithms from Natural Proofs," *31st Conference on Computational Complexity (CCC 2016)*, LIPIcs Vol. 50, pp. 10:1–10:24, 2016. DOI: `10.4230/LIPIcs.CCC.2016.10`
+
+### 3. Hardness vs. Randomness (Derandomization)
+* **Impagliazzo & Wigderson (1997) `[Proved]`:** Established that if $\mathrm{E} = \mathrm{DTIME}[2^{O(n)}]$ contains a language requiring Boolean circuits of size $2^{\Omega(n)}$, then $\mathrm{P} = \mathrm{BPP}$. This bridges circuit lower bounds directly to derandomization.
+  * *Citation:* Russell Impagliazzo and Avi Wigderson, "$\mathrm{P} = \mathrm{BPP}$ if $\mathrm{E}$ Requires Exponential Circuits: Derandomizing the XOR Lemma," *Proceedings of the Twenty-Ninth Annual ACM Symposium on Theory of Computing (STOC '97)*, pp. 220–229, 1997. DOI: `10.1145/258533.258590`
+
+### 4. Meta-Complexity (MCSP & Time-Bounded Kolmogorov Complexity)
+* **Kabanets & Cai (2000) `[Proved]`:** Initiated the modern study of the Minimum Circuit Size Problem (`MCSP`), showing that $\mathrm{MCSP} \in \mathrm{P}$ implies no one-way functions exist, and that proving $\mathrm{NP}$-hardness of `MCSP` via natural reductions would imply major circuit lower bounds.
+  * *Citation:* Valentine Kabanets and Jin-Yi Cai, "Circuit Minimization Problem," *Proceedings of the Thirty-Second Annual ACM Symposium on Theory of Computing (STOC 2000)*, pp. 73–79, 2000.
+* **Hirahara (2018 / 2023) `[Proved]`:** Presented the first **non-black-box** worst-case to average-case reductions within $\mathrm{NP}$ (from approximation versions of time-bounded Kolmogorov complexity $\mathrm{MINKT}$ to $\mathrm{DistNP}$), bypassing black-box reduction barriers toward excluding Impagliazzo's *Heuristica*.
+  * *Citation:* Shuichi Hirahara, "Non-Black-Box Worst-Case to Average-Case Reductions Within $\mathrm{NP}$," *SIAM Journal on Computing*, Vol. 52, Issue 6, 2023 (preliminary version: *FOCS 2018*, pp. 247–258, DOI: `10.1109/FOCS.2018.00032`). Journal DOI: `10.1137/19M124705X`
+* **Liu & Pass (2020) `[Proved]`:** Proved an unconditional equivalence between the existence of one-way functions and the mild average-case hardness of $t$-time-bounded Kolmogorov complexity ($K^t$), characterizing symmetric-key cryptography via a natural meta-complexity problem.
+  * *Citation:* Yanyi Liu and Rafael Pass, "On One-Way Functions and Kolmogorov Complexity," *2020 IEEE 61st Annual Symposium on Foundations of Computer Science (FOCS 2020)*, pp. 1243–1254, 2020. DOI: `10.1109/FOCS46700.2020.00118`
