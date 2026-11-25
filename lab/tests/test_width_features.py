@@ -219,16 +219,29 @@ def test_seed_manifest_shape_and_collisions():
 # ---------------------------------------------------------------------------
 
 
-def _current_repro_manifest():
+def _current_repro_manifest(rows=None):
     """A reproducibility manifest built from the current environment,
     so confirmatory-shaped tests pass the DEE-R9-18 gate (which
     compares the NumPy version and source hashes against the frozen
-    manifest). The gate's failure modes are tested separately."""
+    manifest). The gate's failure modes are tested separately. The
+    manifest is FROZEN-shaped (status FROZEN, authorized True);
+    a DRAFT manifest fails the authorization check (Gate D). When
+    ``rows`` is given, the fitted-model hash is computed from those
+    rows' training fit, so the fitted-model gate passes too --
+    required for any confirmatory PASS/FAIL test."""
+    from om_lab.analyze_width import fit_fingerprint, fit_m0_m1
+
     rep = _reproducibility("confirmatory")
-    return {
+    manifest = {
+        "status": "FROZEN",
+        "confirmatory_authorized": True,
         "environment": {"packages": {"numpy": rep["numpy_version"]}},
         "source_sha256": dict(rep["source_file_sha256"]),
     }
+    if rows is not None:
+        train = [r for r in rows if r["split"] == "train"]
+        manifest["fitted_model_sha256"] = fit_fingerprint(fit_m0_m1(train))
+    return manifest
 
 
 def _row(n, m, split, width, degree, y, index=0, status="SAT"):
@@ -451,7 +464,7 @@ def test_analyze_rows_pass_on_strong_width_signal():
     assert summary["primary_disposition"]["disposition"] == "INCONCLUSIVE"
     rows = _confirmatory_synthetic("width")
     summary = analyze_rows(rows, "confirmatory", bootstrap_replicates=200,
-        reproducibility_manifest=_current_repro_manifest())
+        reproducibility_manifest=_current_repro_manifest(rows))
     assert summary["integrity_gates"]["passed"] is True
     assert summary["verification_gates"]["passed"] is True
     assert summary["primary_disposition"]["disposition"] == "PASS"
@@ -468,7 +481,7 @@ def test_analyze_rows_pass_on_strong_width_signal():
 def test_analyze_rows_fail_when_width_carries_no_signal():
     rows = _confirmatory_synthetic("none")
     summary = analyze_rows(rows, "confirmatory", bootstrap_replicates=200,
-        reproducibility_manifest=_current_repro_manifest())
+        reproducibility_manifest=_current_repro_manifest(rows))
     assert summary["primary_disposition"]["disposition"] == "FAIL"
     assert summary["primary_disposition"]["point_improvement"] < 0.05
     assert summary["primary_disposition"]["point_improvement"] == pytest.approx(0.0)
@@ -497,7 +510,7 @@ def test_verification_gate_blocks_pass_for_uncertified_unsat():
         "width", unsat_verification="UNSAT_SOLVER_AGREEMENT_ONLY"
     )
     summary = analyze_rows(rows, "confirmatory", bootstrap_replicates=200,
-        reproducibility_manifest=_current_repro_manifest())
+        reproducibility_manifest=_current_repro_manifest(rows))
     assert summary["primary_disposition"]["disposition"] == "INCONCLUSIVE"
     assert summary["primary_disposition"]["effort_only_disposition"] == "PASS"
     assert summary["verification_gates"]["passed"] is False
@@ -506,7 +519,7 @@ def test_verification_gate_blocks_pass_for_uncertified_unsat():
         "width", unsat_verification="UNSAT_PROOF_CHECKED"
     )
     summary2 = analyze_rows(rows2, "confirmatory", bootstrap_replicates=200,
-        reproducibility_manifest=_current_repro_manifest())
+        reproducibility_manifest=_current_repro_manifest(rows2))
     assert summary2["verification_gates"]["passed"] is True
     assert summary2["primary_disposition"]["disposition"] == "PASS"
 
@@ -658,6 +671,38 @@ def test_DEE_R9_17_bootstrap_is_equal_cell_weighted():
     assert result["ci_lower_2.5"] == pytest.approx(2 / 3)
     assert result["ci_upper_97.5"] == pytest.approx(2 / 3)
     assert result["mean"] == pytest.approx(2 / 3)
+
+
+def test_DEE_R9_17_point_mae_is_equal_cell_weighted():
+    """DEE-G26-04: evaluate()'s point MAEs are equal-cell-weighted
+    on unequal-size test cells, matching the bootstrap. Cell A has
+    1 test row, cell B has 3; the equal-cell-weighted improvement is
+    0.875, the row-weighted one would be 0.833. (The bootstrap half
+    of G26-04 is already covered by
+    test_DEE_R9_17_bootstrap_is_equal_cell_weighted, whose fixture
+    cells have 2 and 4 rows.)"""
+    train = [
+        _row(30, 120, "train", 10, 5.0, 1.0, index=0),
+        _row(30, 120, "train", 12, 5.0, 2.0, index=1),
+        _row(30, 120, "train", 14, 5.0, 3.0, index=2),
+        _row(40, 160, "train", 20, 5.0, 4.0, index=0),
+        _row(40, 160, "train", 22, 5.0, 5.0, index=1),
+    ]
+    fit = fit_m0_m1(train)
+    assert fit["beta"] == pytest.approx(0.5)
+    test = [
+        _row(30, 120, "test", 13, 5.0, 2.5, index=70),
+        _row(40, 160, "test", 23, 5.0, 6.0, index=70),
+        _row(40, 160, "test", 20, 5.0, 4.0, index=71),
+        _row(40, 160, "test", 22, 5.0, 5.0, index=72),
+    ]
+    ev = evaluate(test, fit, fit_degree_adjusted(train))
+    # Cell A: MAE0 0.5, MAE1 0. Cell B: MAE0 2.5/3, MAE1 0.5/3.
+    # Equal-cell-weighted: MAE0 2/3, MAE1 1/12, improvement 0.875.
+    # Row-weighted would give MAE0 0.75, MAE1 0.125, improvement 0.833.
+    assert ev["mae_m0"] == pytest.approx(2 / 3)
+    assert ev["mae_m1"] == pytest.approx(1 / 12)
+    assert ev["improvement"] == pytest.approx(0.875)
 
 
 def test_DEE_R9_17_bootstrap_samples_exactly_30_per_cell():

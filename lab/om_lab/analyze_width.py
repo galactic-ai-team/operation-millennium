@@ -95,6 +95,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 import csv
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -112,6 +113,7 @@ import numpy as np
 
 from om_lab.features import extract_features_from_clauses
 from om_lab.generators import generate_random_3sat
+from om_lab.proof_check import dimacs_text
 from om_lab.width_features import (
     primal_min_fill_width,
     replay_elimination_order,
@@ -197,6 +199,17 @@ def seed_manifest() -> list[dict]:
                     }
                 )
     return manifest
+
+
+@lru_cache(maxsize=None)
+def _expected_formula_sha256(n: int, m: int, seed: int) -> str:
+    """SHA-256 of the DIMACS text of the canonical instance for
+    ``(n, m, seed)`` -- the same regeneration Claude's runner audit
+    uses (``width_experiment`` audit path). Pure function of the
+    seed, so results are cached across records in one process.
+    """
+    inst = generate_random_3sat(n_vars=n, n_clauses=m, seed=seed)
+    return hashlib.sha256(dimacs_text(n, inst.clauses).encode("utf-8")).hexdigest()
 
 
 def check_seed_manifest(manifest: list[dict]) -> dict:
@@ -415,6 +428,96 @@ def fit_m0_m1(train_rows: list[dict]) -> dict:
         "n_train": len(train_rows),
         "width_mean": statistics.fmean(widths) if widths else 0.0,
         "width_std": statistics.pstdev(widths) if len(widths) > 1 else 0.0,
+    }
+
+
+def fit_fingerprint(fit: dict) -> str:
+    """Deterministic SHA-256 of a fitted M0/M1 model (Section 3.8).
+
+    Canonical JSON of the fit dict returned by :func:`fit_m0_m1`,
+    with per-cell means keyed by ``"n,m"`` strings. The same training
+    records always produce the same fingerprint (the fit is a pure
+    function of the training rows), so the frozen manifest can pin
+    it under ``fitted_model_sha256`` (ruling B4: the frozen
+    fitted-model hash) and the analyzer can verify that the training
+    coefficients it fitted are the frozen ones. Exported so the
+    freeze tooling (Claude's lane) can compute the identical hash
+    when locking the manifest.
+    """
+    canonical = {
+        "beta": fit.get("beta"),
+        "slope_denominator": fit.get("slope_denominator"),
+        "slope_numerator": fit.get("slope_numerator"),
+        "n_train": fit.get("n_train"),
+        "width_mean": fit.get("width_mean"),
+        "width_std": fit.get("width_std"),
+        "cell_mean_y": {
+            f"{n},{m}": v for (n, m), v in fit.get("cell_mean_y", {}).items()
+        },
+        "cell_mean_width": {
+            f"{n},{m}": v
+            for (n, m), v in fit.get("cell_mean_width", {}).items()
+        },
+    }
+    text = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def verify_frozen_fit(fit: dict | None, manifest: dict | None) -> dict:
+    """Check the fitted training model against the frozen manifest.
+
+    Returns a gate dict (``evaluated`` / ``passed`` / ``failures`` /
+    ``fingerprint``). Only evaluated when a manifest is supplied;
+    without one the reproducibility gate already forces
+    INCONCLUSIVE, so this gate stays silent. A manifest that does
+    not pin ``fitted_model_sha256`` fails (B4 requires the frozen
+    fitted-model hash); a pinned hash that differs from the fit
+    computed from the supplied training records fails -- a training
+    coefficient was altered, or the manifest does not match the
+    data. Either way the primary disposition is INCONCLUSIVE.
+    """
+    if manifest is None:
+        return {
+            "evaluated": False,
+            "passed": False,
+            "failures": ["no manifest supplied; fitted model not verified"],
+            "fingerprint": None,
+        }
+    if fit is None or not fit.get("n_train"):
+        return {
+            "evaluated": False,
+            "passed": False,
+            "failures": ["no training fit to verify against the manifest"],
+            "fingerprint": None,
+        }
+    fingerprint = fit_fingerprint(fit)
+    frozen = manifest.get("fitted_model_sha256")
+    if frozen is None:
+        return {
+            "evaluated": False,
+            "passed": False,
+            "failures": [
+                "fitted model hash not pinned in manifest (B4: the "
+                "frozen fitted-model hash is required)"
+            ],
+            "fingerprint": fingerprint,
+        }
+    if frozen != fingerprint:
+        return {
+            "evaluated": True,
+            "passed": False,
+            "failures": [
+                "fitted model hash differs from the manifest: a "
+                "training coefficient was altered, or the manifest "
+                "does not match the training records"
+            ],
+            "fingerprint": fingerprint,
+        }
+    return {
+        "evaluated": True,
+        "passed": True,
+        "failures": [],
+        "fingerprint": fingerprint,
     }
 
 
@@ -651,14 +754,17 @@ def paired_stratified_bootstrap(
     including non-confirmatory cells with fewer than 30 rows: the 30
     draws are taken with replacement from whatever rows the cell
     has. A cell with k < 30 rows is therefore resampled as if it
-    were a 30-row cell, so the interval understates that cell's
-    sampling variability; for non-confirmatory populations the
-    interval is illustrative only (the disposition is INCONCLUSIVE
-    by construction). For the confirmatory population the integrity
-    gates enforce exactly 30 test rows per cell, so the draw size
-    matches the cell size. No assert enforces a minimum cell size,
-    because the pilot legitimately has 5 test rows per cell
-    (DEE-R9-17 follow-up).
+    were a 30-row cell, so the bootstrap variability of that cell's
+    mean is understated relative to a same-size bootstrap. That
+    distinction matters: narrower per-cell-mean variability does not
+    guarantee that the nonlinear MAE-improvement ratio interval is
+    narrower, so the interval for a small cell is illustrative only
+    (the disposition is INCONCLUSIVE by construction for
+    non-confirmatory populations). For the confirmatory population
+    the integrity gates enforce exactly 30 test rows per cell, so
+    the draw size matches the cell size. No assert enforces a
+    minimum cell size, because the pilot legitimately has 5 test
+    rows per cell (DEE-R9-17 follow-up; Ace Gate D §2).
     The replicate improvement is 1 - MAE1 / MAE0 with the
     MAEs equal-cell-weighted (mean of per-cell MAEs), matching
     evaluate() (DEE-R9-17). Fitted models are fixed; only the test
@@ -838,6 +944,7 @@ def primary_disposition(
     reproducibility: dict | None = None,
     eval_error: str | None = None,
     n_error_rows: int = 0,
+    fitted_model: dict | None = None,
 ) -> dict:
     """One machine-readable primary disposition (Section 3.10).
 
@@ -850,7 +957,10 @@ def primary_disposition(
     is the blocker. A reproducibility gate that was not evaluated or
     that failed also forces INCONCLUSIVE (Section 3.10, DEE-R9-18).
     Any excluded ERROR row also forces INCONCLUSIVE: it is missing
-    data, not a measurement (DEE-R9-04 follow-up).
+    data, not a measurement (DEE-R9-04 follow-up). A fitted-model
+    gate that was not evaluated or that failed also forces
+    INCONCLUSIVE: the training coefficients fitted here must match
+    the frozen model pinned in the manifest (B4).
     """
     reasons: list[str] = []
     if not gates["passed"]:
@@ -864,6 +974,13 @@ def primary_disposition(
             )
         elif not reproducibility.get("passed"):
             reasons.extend(reproducibility.get("failures", []))
+    if fitted_model is not None:
+        if not fitted_model.get("evaluated"):
+            reasons.extend(
+                fitted_model.get("failures", ["fitted model gate not evaluated"])
+            )
+        elif not fitted_model.get("passed"):
+            reasons.extend(fitted_model.get("failures", []))
     if n_error_rows > 0:
         reasons.append(
             f"{n_error_rows} ERROR row(s) excluded as missing data "
@@ -991,6 +1108,12 @@ def reproducibility_gates(frozen: dict | None) -> dict:
     business, not this analysis's. ``frozen is None`` means the gate
     was not evaluated: that is a failure, not a pass -- a
     confirmatory disposition must never rest on an unevaluated gate.
+
+    Authorization (Gate D): only a manifest with status ``FROZEN``
+    and ``confirmatory_authorized`` exactly ``True`` authorizes a
+    confirmatory disposition. A DRAFT manifest -- or one that does
+    not declare itself authorized -- fails this gate. The strict
+    ``is not True`` check rejects the string ``"true"`` (B5.2).
     """
     current = _reproducibility("confirmatory")
     checked = {
@@ -1005,6 +1128,12 @@ def reproducibility_gates(frozen: dict | None) -> dict:
             "checked": checked,
         }
     failures: list[str] = []
+    if frozen.get("status") != "FROZEN" or frozen.get("confirmatory_authorized") is not True:
+        failures.append(
+            "manifest is not a FROZEN authorized manifest "
+            f"(status={frozen.get('status')!r}, "
+            f"confirmatory_authorized={frozen.get('confirmatory_authorized')!r})"
+        )
     packages = (frozen.get("environment") or {}).get("packages") or {}
     frozen_numpy = packages.get("numpy")
     if frozen_numpy is None:
@@ -1038,6 +1167,7 @@ def analyze_rows(
     bootstrap_seed: int = BOOTSTRAP_SEED,
     budget: int = BUDGET_B,
     reproducibility_manifest: dict | None = None,
+    n_error_rows_excluded: int = 0,
 ) -> dict:
     """Run the frozen OM-C001-R2 analysis over already-built rows.
 
@@ -1055,12 +1185,19 @@ def analyze_rows(
     JSON, or None to leave the reproducibility gate unevaluated --
     which forces INCONCLUSIVE for the confirmatory population
     (DEE-R9-18).
+    ``n_error_rows_excluded`` is the number of ERROR records a
+    caller already removed before conversion (the official path,
+    ``analyze_records``, counts them in the raw records and passes
+    the count here, ACE-GATE-D-01); it is added to the ERROR rows
+    found in ``rows`` itself, so the total reaches the disposition
+    and the output metadata instead of being lost in conversion.
     """
     if population not in {"confirmatory", "pilot", "synthetic"}:
         raise ValueError(f"unknown population {population!r}")
     n_error_rows = sum(1 for r in rows if r.get("status") == "ERROR")
     if n_error_rows:
         rows = [r for r in rows if r.get("status") != "ERROR"]
+    n_error_rows += n_error_rows_excluded
     train_rows = [r for r in rows if r["split"] == "train"]
     test_rows = [r for r in rows if r["split"] == "test"]
     gates = integrity_gates(rows, population, budget=budget)
@@ -1068,6 +1205,11 @@ def analyze_rows(
     reproducibility = reproducibility_gates(reproducibility_manifest)
     fit = fit_m0_m1(train_rows) if train_rows else {"beta": None}
     fit_deg = fit_degree_adjusted(train_rows) if train_rows else {}
+    fitted_model = (
+        verify_frozen_fit(fit, reproducibility_manifest)
+        if reproducibility_manifest is not None and train_rows
+        else None
+    )
     evaluation: dict | None = None
     bootstrap: dict | None = None
     eval_error: str | None = None
@@ -1097,7 +1239,7 @@ def analyze_rows(
     disposition = primary_disposition(
         evaluation, bootstrap, gates, verification, fit,
         reproducibility=reproducibility, eval_error=eval_error,
-        n_error_rows=n_error_rows,
+        n_error_rows=n_error_rows, fitted_model=fitted_model,
     )
     if population != "confirmatory":
         disposition = {
@@ -1170,6 +1312,7 @@ def analyze_rows(
         "integrity_gates": gates,
         "verification_gates": verification,
         "reproducibility_gates": reproducibility,
+        "fitted_model_gate": fitted_model,
         "fit_m0_m1": {
             "beta": fit.get("beta"),
             "slope_denominator": fit.get("slope_denominator"),
@@ -1241,6 +1384,381 @@ def analyze_rows(
 def count_error_records(records: list[dict]) -> int:
     """Number of runner records with ``status == "ERROR"`` (missing data)."""
     return sum(1 for rec in records if rec.get("status") == "ERROR")
+
+
+#: Runner record schema version the official analysis path accepts.
+RECORD_SCHEMA_VERSION = 1
+
+
+def _require_finite_number(field: str, value, fail) -> None:
+    """Reject NaN / inf and ints too large for a finite float (DEE-G26-01).
+
+    ``type(value)`` is already known to be ``int`` or ``float`` at call
+    sites (bool is rejected earlier).  ``fail`` is the field-name
+    formatter from ``validate_record_types``.
+    """
+    if type(value) is float:
+        if not math.isfinite(value):
+            fail(field, "a finite number (not NaN or inf)", value)
+        return
+    # int path: reject values that overflow to inf when converted to
+    # float, and (defensively) any int whose float conversion is not
+    # finite.  Small ints pass through unchanged.
+    try:
+        converted = float(value)
+    except OverflowError:
+        fail(field, "a number representable as a finite float", value)
+        return
+    if not math.isfinite(converted):
+        fail(field, "a number representable as a finite float", value)
+
+
+def validate_record_types(record: dict) -> None:
+    """Strict raw-record validation for the official path (Gate D4).
+
+    Every field must already have its JSON type: ints are ints (not
+    bools, not strings, not floats), booleans are booleans, strings
+    are strings. Nothing is coerced -- ``bool("false")`` is True and
+    ``int("30")`` is 30, so a converter that coerces would silently
+    certify malformed data (NOVA-R10-09/11). Raises ``ValueError``
+    naming the offending field; returns None on success.
+
+    The experiment identifier must be exactly ``"OM-C001-R2"`` and
+    the schema version exactly 1; a record from another experiment
+    or schema is rejected here, before any identity check. Fields
+    that the runner leaves ``None`` on an ERROR record (decisions,
+    propagations, y, width, degree_mean, formula hash on a
+    generation failure) must be ``None`` for ERROR records and
+    present with the right type otherwise. The permissive converter
+    :func:`records_to_rows` keeps the legacy behaviour for
+    exploratory data; the official path (:func:`analyze_records`)
+    calls this first, so no coercion in the converter can reach a
+    confirmatory disposition.
+    """
+    iid = record.get("instance_id", "?")
+
+    def fail(field: str, want: str, got: object) -> None:
+        raise ValueError(
+            f"record {iid!r}: field {field!r} must be {want}, "
+            f"got {type(got).__name__} {got!r}"
+        )
+
+    def req(field: str):
+        if field not in record:
+            raise ValueError(f"record {iid!r}: missing required field {field!r}")
+        return record[field]
+
+    def req_int(field: str, *, minimum: int | None = None, maximum: int | None = None) -> int:
+        value = req(field)
+        if type(value) is not int:  # bool is a subclass of int; exclude it
+            fail(field, "an int (not bool, str or float)", value)
+        if minimum is not None and value < minimum:
+            fail(field, f"an int >= {minimum}", value)
+        if maximum is not None and value > maximum:
+            fail(field, f"an int <= {maximum}", value)
+        return value
+
+    def req_bool(field: str) -> bool:
+        value = req(field)
+        if type(value) is not bool:
+            fail(field, "a JSON boolean (not a string or int)", value)
+        return value
+
+    def req_str(field: str) -> str:
+        value = req(field)
+        if type(value) is not str:
+            fail(field, "a string", value)
+        return value
+
+    def req_number(field: str):
+        value = req(field)
+        if type(value) not in (int, float):
+            fail(field, "a number (not bool or str)", value)
+        # DEE-G26-01: reject NaN / inf and ints that cannot be
+        # represented as a finite float.  ``degree_mean`` is used
+        # downstream by ``fit_degree_adjusted``; a NaN poisons the M2/M3
+        # output, and ``json.dumps`` writes an invalid ``NaN`` token
+        # into ``width_analysis.json``.  ``y`` and ``max_seconds`` are
+        # covered by the same fix for consistency.
+        _require_finite_number(field, value, fail)
+        return value
+
+    def opt_int(field: str, *, minimum: int | None = None):
+        value = req(field)
+        if value is None:
+            return None
+        if type(value) is not int:
+            fail(field, "an int or null", value)
+        if minimum is not None and value < minimum:
+            fail(field, f"an int >= {minimum} or null", value)
+        return value
+
+    def opt_str(field: str):
+        value = req(field)
+        if value is not None and type(value) is not str:
+            fail(field, "a string or null", value)
+        return value
+
+    def opt_number(field: str):
+        value = req(field)
+        if value is not None and type(value) not in (int, float):
+            fail(field, "a number or null", value)
+        if value is not None:
+            _require_finite_number(field, value, fail)
+        return value
+
+    def opt_bool(field: str):
+        value = req(field)
+        if value is not None and type(value) is not bool:
+            fail(field, "a boolean or null", value)
+        return value
+
+    status = req_str("status")
+    if status not in ("SAT", "UNSAT", "UNKNOWN", "ERROR"):
+        fail("status", "one of SAT, UNSAT, UNKNOWN, ERROR", status)
+    is_error = status == "ERROR"
+
+    experiment = req_str("experiment")
+    if experiment != CONFIRMATORY_SEED_PREFIX:
+        raise ValueError(
+            f"record {iid!r}: field 'experiment' must be "
+            f"{CONFIRMATORY_SEED_PREFIX!r}, got {experiment!r}"
+        )
+    schema = req_int("record_schema_version")
+    if schema != RECORD_SCHEMA_VERSION:
+        raise ValueError(
+            f"record {iid!r}: field 'record_schema_version' must be "
+            f"{RECORD_SCHEMA_VERSION}, got {schema!r}"
+        )
+    req_str("runner_version")
+    population = req_str("population")
+    if population not in ("confirmatory", "pilot"):
+        fail("population", "one of 'confirmatory', 'pilot'", population)
+    split = req_str("split")
+    if split not in ("train", "test"):
+        fail("split", "one of 'train', 'test'", split)
+    req_str("instance_id")
+    problem = req_str("problem")
+    if problem != "random_3sat":
+        raise ValueError(
+            f"record {iid!r}: field 'problem' must be 'random_3sat', "
+            f"got {problem!r}"
+        )
+    req_int("n_vars", minimum=3)
+    req_int("n_clauses", minimum=1)
+    req_int("a_hundredths", minimum=1)
+    req_int("index", minimum=0, maximum=99)
+    req_int("seed", minimum=0)
+    req_str("seed_hex")
+    formula_sha = req("formula_sha256")
+    if formula_sha is not None and type(formula_sha) is not str:
+        fail("formula_sha256", "a string or null", formula_sha)
+    if formula_sha is None and not is_error:
+        raise ValueError(
+            f"record {iid!r}: field 'formula_sha256' must be a string "
+            "for a non-ERROR record"
+        )
+    # Features: present with the right type for a solved record,
+    # null for an ERROR record (the runner writes no features then).
+    if is_error:
+        for field in ("width", "width_replay", "width_ordering_sha256",
+                      "width_reversed", "degree_mean"):
+            if req(field) is not None:
+                fail(field, "null for an ERROR record", record[field])
+    else:
+        req_int("width", minimum=0)
+        req_bool("width_replay")
+        req_str("width_ordering_sha256")
+        req_int("width_reversed", minimum=0)
+        req_number("degree_mean")
+    req_str("solver")
+    req_int("budget_b", minimum=1)
+    req_int("max_decisions", minimum=1)
+    opt_number("max_seconds")
+    # stop_reason is None for a completed run, "decision_budget" /
+    # "time_budget" when a budget stopped it.
+    opt_str("stop_reason")
+    if is_error:
+        for field in ("decisions", "propagations", "y"):
+            if req(field) is not None:
+                fail(field, "null for an ERROR record", record[field])
+    else:
+        req_int("decisions", minimum=0)
+        req_int("propagations", minimum=0)
+        req_number("y")
+    req_bool("budget_exhausted")
+    req_bool("satisfiable")
+    req_bool("timed_out")
+    req_bool("verified")
+    req_str("verification_status")
+    model = req("model")
+    if model is not None:
+        if type(model) is not list:
+            fail("model", "a list of ints or null", model)
+        for lit in model:
+            if type(lit) is not int:
+                fail("model", "a list of ints or null", model)
+    reference = req("reference")
+    if reference is not None and type(reference) is not dict:
+        fail("reference", "an object or null", reference)
+    opt_str("reference_agreement")
+    opt_str("integrity_alarm")
+    error = req("error")
+    if error is not None:
+        if type(error) is not dict:
+            fail("error", "an object or null", error)
+        if type(error.get("kind")) is not str or type(error.get("attempts")) is not int:
+            fail("error", "an object with str 'kind' and int 'attempts'", error)
+
+
+def validate_population_identity(records: list[dict], population: str) -> dict:
+    """Validate raw records against the canonical seed manifest (Gate D1).
+
+    For the confirmatory population only; other populations return
+    ``passed=True`` with a note (their identity is not frozen --
+    pilot cells vary by construction). Checks, per record and for
+    the set as a whole, that the records ARE the registered
+    population, not merely shaped like it (NOVA-R10-12): the exact
+    28 cells, the exact indices 0..99, the exact instance IDs, the
+    exact seeds and seed hexes, the exact clause counts and splits,
+    and the exact formula hashes (regenerated from the seed, the
+    same regeneration the runner audit uses). Duplicates, missing
+    rows and extra rows all fail. ERROR records are checked on
+    their identity fields too (their measurements are missing, but
+    their identity is still a claim about which instance failed);
+    a null formula hash on an ERROR record (generation failure) is
+    the only hash exemption.
+
+    Callers must run :func:`validate_record_types` first: this
+    function assumes well-typed fields. Raises ``ValueError``
+    listing the failures (at most 10) on any mismatch; returns a
+    summary dict on success. It does NOT re-verify width or
+    degree_mean -- those are derived features, covered by the
+    runner's audit (``--recompute-features``), not by population
+    identity (see Limitations in the reply to Lumi).
+    """
+    if population != "confirmatory":
+        return {
+            "passed": True,
+            "failures": [],
+            "note": "population identity is frozen for the confirmatory population only",
+            "n_records": len(records),
+        }
+    canonical = {
+        (row["n"], row["a_hundredths"], row["index"]): row
+        for row in seed_manifest()
+    }
+    failures: list[str] = []
+    seen: set[tuple[int, int, int]] = set()
+    for rec in records:
+        key = (rec["n_vars"], rec["a_hundredths"], rec["index"])
+        iid = rec.get("instance_id", "?")
+        if key in seen:
+            failures.append(f"duplicate record for {iid!r}")
+            continue
+        seen.add(key)
+        expected = canonical.get(key)
+        if expected is None:
+            failures.append(
+                f"record {iid!r}: cell/index {(rec['n_vars'], rec['a_hundredths'], rec['index'])} "
+                "is not a registered confirmatory cell/index"
+            )
+            continue
+        want_id = f"{CONFIRMATORY_SEED_PREFIX}|{rec['n_vars']}|{rec['a_hundredths']}|{rec['index']}"
+        if rec["instance_id"] != want_id:
+            failures.append(
+                f"record {iid!r}: instance_id must be {want_id!r}"
+            )
+        if rec["seed"] != expected["seed"]:
+            failures.append(
+                f"record {iid!r}: seed does not match the canonical "
+                "seed manifest for its cell/index"
+            )
+        if rec["seed_hex"] != f"{expected['seed']:032x}":
+            failures.append(f"record {iid!r}: seed_hex does not match its seed")
+        if rec["n_clauses"] != expected["m"]:
+            failures.append(
+                f"record {iid!r}: n_clauses {rec['n_clauses']} != "
+                f"canonical {expected['m']}"
+            )
+        want_split = "train" if rec["index"] <= TRAIN_INDEX_MAX else "test"
+        if rec["split"] != want_split:
+            failures.append(
+                f"record {iid!r}: split must be {want_split!r} for index {rec['index']}"
+            )
+        formula_sha = rec.get("formula_sha256")
+        if formula_sha is not None:
+            want_sha = _expected_formula_sha256(
+                rec["n_vars"], expected["m"], expected["seed"]
+            )
+            if formula_sha != want_sha:
+                failures.append(
+                    f"record {iid!r}: formula_sha256 does not match the "
+                    "instance regenerated from its canonical seed"
+                )
+        if len(failures) >= 10:
+            break
+    missing = sorted(set(canonical) - seen)
+    if missing:
+        failures.append(
+            f"{len(missing)} registered instance(s) missing from the records "
+            f"(first: {missing[0]})"
+        )
+    extra = sorted(seen - set(canonical))
+    if extra:
+        failures.append(f"{len(extra)} record(s) outside the registered population")
+    if failures:
+        raise ValueError(
+            "population identity validation failed "
+            f"({len(failures)} failure(s)): " + "; ".join(failures[:10])
+        )
+    return {
+        "passed": True,
+        "failures": [],
+        "n_records": len(records),
+        "n_cells": 28,
+    }
+
+
+def analyze_records(
+    records: list[dict],
+    population: str,
+    bootstrap_replicates: int = BOOTSTRAP_REPLICATES,
+    bootstrap_seed: int = BOOTSTRAP_SEED,
+    budget: int = BUDGET_B,
+    reproducibility_manifest: dict | None = None,
+) -> tuple[dict, list[dict]]:
+    """The official analysis path over raw runner records (Gate D).
+
+    Order matters (Ace D1/D3/D4): strict raw-record types first
+    (nothing is coerced), then population identity against the
+    canonical seed manifest -- both BEFORE :func:`records_to_rows`
+    -- then conversion, then :func:`analyze_rows`. The raw ERROR
+    count is counted before conversion and carried through
+    (ACE-GATE-D-01), so the official disposition and output
+    metadata see it even though conversion drops the ERROR records.
+    Returns ``(summary, rows)``. Raises ``ValueError`` on any
+    validation failure: a malformed or misidentified population is
+    rejected, not analysed. Direct :func:`analyze_rows` /
+    :func:`records_to_rows` remain available for exploratory data
+    (pilot, synthetic, legacy records), but they are not the
+    official confirmatory path.
+    """
+    n_error_raw = count_error_records(records)
+    for rec in records:
+        validate_record_types(rec)
+    validate_population_identity(records, population)
+    rows = records_to_rows(records)
+    summary = analyze_rows(
+        rows,
+        population,
+        bootstrap_replicates=bootstrap_replicates,
+        bootstrap_seed=bootstrap_seed,
+        budget=budget,
+        reproducibility_manifest=reproducibility_manifest,
+        n_error_rows_excluded=n_error_raw,
+    )
+    return summary, rows
 
 
 def records_to_rows(records: list[dict]) -> list[dict]:
@@ -1620,6 +2138,7 @@ def main() -> None:
         )
         population = "pilot"
         print(f"Generated {len(rows)} pilot rows (pilot seeds, not confirmatory).")
+        summary = analyze_rows(rows, population)
     elif args.records:
         if args.population is None:
             parser.error("--population is required with --records")
@@ -1630,16 +2149,23 @@ def main() -> None:
                 f"WARNING: {n_error} ERROR record(s) are missing data and were "
                 "excluded; rerun them with the same instance and budget."
             )
-        rows = records_to_rows(records)
+        repro_manifest = None
+        if args.reproducibility_manifest:
+            with open(args.reproducibility_manifest, encoding="utf-8") as handle:
+                repro_manifest = json.load(handle)
+        # Official path (Gate D): strict raw-record types, then
+        # population identity, both before conversion; the raw ERROR
+        # count is carried into the disposition and output metadata
+        # (ACE-GATE-D-01). A validation failure raises and the CLI
+        # exits non-zero: a malformed or misidentified population is
+        # rejected, not analysed.
+        summary, rows = analyze_records(
+            records, args.population, reproducibility_manifest=repro_manifest
+        )
         population = args.population
     else:
         parser.error("specify --pilot or --records")
 
-    repro_manifest = None
-    if args.reproducibility_manifest:
-        with open(args.reproducibility_manifest, encoding="utf-8") as handle:
-            repro_manifest = json.load(handle)
-    summary = analyze_rows(rows, population, reproducibility_manifest=repro_manifest)
     # Plot points (width, y, status) for held-out rows.
     evaluation_paired = None
     if summary["evaluation"] is not None:
