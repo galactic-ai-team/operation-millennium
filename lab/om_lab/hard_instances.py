@@ -184,12 +184,17 @@ def generate_planted_3sat(
     clauses: list[list[int]] = []
     for _ in range(n_clauses):
         chosen = rng.sample(range(1, n_vars + 1), 3)
-        clause: list[int] = []
-        for v in chosen:
-            if rng.random() < 0.5:
-                clause.append(v if hidden[v] else -v)
-            else:
-                clause.append(-v if hidden[v] else v)
+        while True:
+            clause: list[int] = []
+            for v in chosen:
+                if rng.random() < 0.5:
+                    clause.append(v if hidden[v] else -v)
+                else:
+                    clause.append(-v if hidden[v] else v)
+            # Lumi repair: reject sign patterns that falsify the hidden
+            # assignment, so every clause is satisfied by it (planted model).
+            if any((lit > 0) == hidden[abs(lit)] for lit in clause):
+                break
         clauses.append(clause)
 
     return CNFInstance(

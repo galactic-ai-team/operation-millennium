@@ -10,7 +10,7 @@ from om_lab.hard_instances import (
     generate_planted_3sat,
     generate_tseitin_3sat,
 )
-from om_lab.solvers import solve_dpll, solve_pysat
+from om_lab.solvers import solve_dpll, solve_pysat, verify_cnf_assignment
 
 
 def test_php_small_unsat_pysat() -> None:
@@ -72,3 +72,14 @@ def test_literals_are_in_range() -> None:
             for lit in clause:
                 assert 1 <= abs(lit) <= inst.n_vars
 
+
+def test_planted_3sat_hidden_assignment_satisfies() -> None:
+    """Regression (Lumi): the hidden assignment must satisfy every clause,
+    including at clause densities above the 3-SAT threshold (~4.27)."""
+    for seed in range(20):
+        inst = generate_planted_3sat(n_vars=30, n_clauses=180, seed=seed)
+        hidden = inst.metadata["hidden_assignment"]
+        model = [int(v) if val else -int(v) for v, val in hidden.items()]
+        assert verify_cnf_assignment(inst.clauses, model)
+        res = solve_pysat(inst.n_vars, inst.clauses)
+        assert res.satisfiable and res.verified
