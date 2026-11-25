@@ -268,6 +268,8 @@ python -m om_lab.width_experiment combine --out $OUT/results.jsonl \
     $OUT/confirmatory_train_results.jsonl $OUT/confirmatory_test_results.jsonl
 python -m om_lab.width_experiment audit $OUT/results.jsonl --splits train test \
     --certificates-dir $OUT/certificates --certificate-manifest $OUT/certificate_manifest.json
+# The test run, combine and audit commands must each have exited 0 before this step:
+# the analysis handoff binds their hashes but does not re-read their integrity verdicts (10.12).
 python -m om_lab.analyze_width --records $OUT/results.jsonl --population confirmatory \
     --stage-a $OUT/freeze/freeze_stage_a.json --stage-b $OUT/freeze/freeze_stage_b.json \
     --test-run-manifest $OUT/confirmatory_test_run_manifest.json \
@@ -646,3 +648,69 @@ regression tests, which analyse fabricated populations that no Stage A
 can be built over); it is not the official path, and it cannot be
 combined with the handoff flags. The official final analysis command
 is step 6 above.
+
+### 10.12 Runner-side Stage A/B integration (ACE-GATE-D-02)
+
+Author: Claude (Stage A/B integration on the execution side). Base: `dev` @ `2c45258`.
+Every result here is **[Claim Level: Empirical Observation]**.
+
+**What the handoff reads, and which runner step writes it.** `build_analysis_handoff`
+(10.11) consumes two runner artefacts. Every field it checks is written by the runner
+under the same name:
+
+| Handoff check | Field read | Written by |
+|---|---|---|
+| the authorised OFFICIAL test run | `experiment`, `population`, `split`, `run_mode`, `complete` | `run_split`, `confirmatory_test_run_manifest.json` |
+| the frozen test schedule | `schedule_sha256` | `run_split`: `freeze.schedule_sha256` of the scheduled specs, equal to Stage A `population.test.schedule_sha256` |
+| the authorisation | `authorization.stage_a_sha256`, `.stage_b_sha256`, `.test_schedule_sha256`, `.authorized_by`, `.authorized_at_utc` | `run_split`, from the `AuthorizedFreeze` issued by `verify_for_execution` |
+| the test output | `results_sha256` | `run_split`: SHA-256 of the bytes of `confirmatory_test_results.jsonl` |
+| the combined input | `population`, `complete`, `results_sha256`, `inputs[].sha256` | `combine_results`, `<out>_combine_manifest.json` (e.g. `results_combine_manifest.json`) |
+
+**End-to-end test** (`lab/tests/test_stage_ab_chain_e2e.py`). It runs the whole chain
+with the production code at every step: training run, `stage-a`, `authorize`
+(preflight, then Stage B), the official test run (`verify_for_execution`, the
+`run_specs` guard, real worker processes), `combine`, the retained-certificate audit,
+`build_analysis_handoff`, and the step 6 `analyze_width` command, which reaches the
+primary disposition with the integrity, verification, reproducibility and fitted-model
+gates passing. A second test takes the same artefacts and checks that these are
+refused: a second Stage B written later by `authorize`, test output changed and then
+recombined, combined records changed, the training run's manifest offered as the test
+run, an official run without Stage B, and an analysis without the handoff.
+
+The design is synthetic and unregistered: for that test module only, `N_VALUES` and
+`A_VALUES` become n in {12, 14, 16, 18} and A in {2.00, 2.50, 3.00, 6.00, 7.00, 8.00,
+9.00}. The registered shape (28 cells, 70 train / 30 test), the seed scheme, the budget
+and every check are unchanged. No registered cell is in this design. A guard refuses to
+start a worker for any spec with a registered n or A, so no registered training or
+held-out instance is generated, solved or read. The test checks how the chain behaves,
+never which disposition the synthetic data reaches. Stage B is written only by
+`authorize`. The module takes about 40 s.
+
+**Runner fix: the authorisation names the verified Stage B.** `verify_for_execution`
+parsed Stage B from one read but hashed it from a second read for
+`authorization.stage_b_sha256`, which is the value the handoff binds to. If Stage B was
+replaced between the two reads, the authorisation was still issued and named the
+replacement bytes (reproduced at `2c45258` with the replacement `{}`). It now hashes the
+bytes it verified and refuses with "Stage B changed while it was being verified"
+(`test_authorisation_names_the_stage_b_bytes_that_were_verified`). Nothing else in the
+accepted Gate B/D behaviour changes.
+
+**Open items for the analysis side (team decisions, not changed here).**
+
+- The handoff and the analysis do not consult the runner's integrity verdict. In a
+  sandbox run on the same synthetic design, one SAT model in the official test output
+  was made to falsify its formula (a simulated runner defect). The test run manifest and
+  the combine manifest then recorded `complete: true` with `integrity.passed: false`,
+  and the audit failed. The handoff was still accepted, and the analysis passed all
+  four gates and reached a disposition. Until the handoff checks those verdicts (or a
+  hash-bound audit report), the procedural guard is the step 6 comment above.
+- The diagnostic `--reproducibility-manifest` route can still give a confirmatory
+  disposition from a hand-built FROZEN manifest. Nova's positive control
+  `test_official_path_passes_on_complete_correct_dataset` reaches PASS through
+  `analyze_records` that way. `primary_result.json` does not record which route was
+  used, and by source inspection a loaded manifest with
+  `kind: "OM-C001-R2/analysis-handoff"` is echoed as a verified handoff.
+  Recommendation: restrict it, don't remove it. Keep it for pilot, synthetic and
+  diagnostic use. For `--population confirmatory`, cap the disposition at INCONCLUSIVE
+  unless the manifest came from `build_analysis_handoff` in the same process, and
+  record the route in `primary_result.json`.
