@@ -10,16 +10,23 @@ from om_lab.hard_instances import (
     generate_planted_3sat,
     generate_tseitin_3sat,
 )
-from om_lab.solvers import solve_dpll, solve_pysat, verify_cnf_assignment
+from om_lab.solvers import Status, Verification, solve_dpll, solve_pysat, verify_cnf_assignment
 
 
 def test_php_small_unsat_pysat() -> None:
+    # OM-C001-R2 semantics repair: an UNSAT return is only "verified" when an
+    # independent checker accepts its proof certificate (Section 4.1).
     for n in range(1, 6):
         inst = generate_php(n)
         assert inst.n_vars == (n + 1) * n
-        res = solve_pysat(inst.n_vars, inst.clauses)
+        res = solve_pysat(inst.n_vars, inst.clauses, certify=True)
         assert not res.satisfiable
+        assert res.status == Status.UNSAT
+        assert res.verification_status == Verification.UNSAT_PROOF_CHECKED
         assert res.verified
+        uncertified = solve_pysat(inst.n_vars, inst.clauses)
+        assert uncertified.verification_status == Verification.UNVERIFIED
+        assert not uncertified.verified
 
 
 def test_php_small_unsat_dpll() -> None:
@@ -27,15 +34,19 @@ def test_php_small_unsat_dpll() -> None:
         inst = generate_php(n)
         res = solve_dpll(inst.n_vars, inst.clauses, max_decisions=100_000)
         assert not res.satisfiable
-        assert res.verified
+        assert res.status == Status.UNSAT
+        # DPLL emits no certificate, so its UNSAT claim is UNVERIFIED on its own.
+        assert res.verification_status == Verification.UNVERIFIED
+        assert not res.verified
         assert not res.timed_out
 
 
 def test_tseitin_unsat_pysat() -> None:
     for n_vertices in (4, 6, 8):
         inst = generate_tseitin_3sat(n_vertices, charge_pattern="unsat")
-        res = solve_pysat(inst.n_vars, inst.clauses)
+        res = solve_pysat(inst.n_vars, inst.clauses, certify=True)
         assert not res.satisfiable
+        assert res.verification_status == Verification.UNSAT_PROOF_CHECKED
         assert res.verified
 
 
