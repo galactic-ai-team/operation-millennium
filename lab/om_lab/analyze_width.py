@@ -1567,7 +1567,12 @@ def validate_record_types(record: dict) -> None:
                 fail(field, "null for an ERROR record", record[field])
     else:
         req_int("width", minimum=0)
-        req_bool("width_replay")
+        # width_replay is the replayed elimination-order width (an int,
+        # equal to width when the replay agrees), not a boolean: the
+        # runner writes replay_elimination_order(...) into the record
+        # (NOVA-G28-02 -- the Gate D validator previously required a
+        # bool here and rejected every genuine runner record).
+        req_int("width_replay", minimum=0)
         req_str("width_ordering_sha256")
         req_int("width_reversed", minimum=0)
         req_number("degree_mean")
